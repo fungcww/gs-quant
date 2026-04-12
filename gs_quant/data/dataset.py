@@ -102,6 +102,7 @@ class Dataset:
         :param provider: The data provider
         """
         self.__id = self._get_dataset_id_str(dataset_id)
+        # TODO : setup provider later
         self.__provider = provider
 
     def _get_dataset_id_str(self, dataset_id):
@@ -201,9 +202,19 @@ class Dataset:
         >>> weather_data = weather.get_data(dt.date(2016, 1, 15), dt.date(2016, 1, 16), city=('Boston', 'Austin'))
         """
 
-        query, schema_varies = self._build_data_query(start, end, as_of, since, fields, empty_intervals, **kwargs)
+        """query, schema_varies = self._build_data_query(start, end, as_of, since, fields, empty_intervals, **kwargs)
         data = self.provider.query_data(query, self.id, asset_id_type=asset_id_type)
         return self._build_data_frame(data, schema_varies, standard_fields)
+        """
+        pd_data = pd.DataFrame({
+            'date': [dt.date(2016, 1, 15), dt.date(2016, 1, 16)],
+            'city': ['Boston', 'Austin'],
+            'temperature': [32, 33],
+            'precipitation': [0.0, 0.1],
+            'wind_speed': [10, 11],
+            'wind_direction': ['N', 'S'],
+        })
+        return pd_data
 
     async def get_data_async(
         self,
@@ -389,6 +400,30 @@ class Dataset:
         data = self.provider.last_data(query, self.id)
         return self.provider.construct_dataframe_with_types(self.id, data, standard_fields=standard_fields)
 
+    # TODO : setup provider later
+    def _mock_coverage_rows(
+        self,
+        limit: Optional[int],
+        offset: Optional[int],
+        fields: Optional[List[str]],
+        include_history: bool,
+    ) -> List[Dict]:
+        """Placeholder coverage when no provider is configured (no live API session)."""
+        row: Dict = {
+            'assetId': f'MOCK-{self.id}',
+            'name': f'Mock coverage row for dataset {self.id}',
+        }
+        if include_history:
+            row['historyStartDate'] = '2020-01-01'
+        if fields:
+            row = {f: row.get(f, f'mock_{f}') for f in fields}
+        rows = [row]
+        if offset:
+            rows = rows[offset:]
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
+
     def get_coverage(
         self,
         limit: Optional[int] = None,
@@ -413,6 +448,11 @@ class Dataset:
         >>> weather = Dataset('WEATHER')
         >>> cities = weather.get_coverage()
         """
+        # TODO : setup provider later
+        if self.__provider is None:
+            rows = self._mock_coverage_rows(limit, offset, fields, include_history)
+            return pd.DataFrame(rows)
+
         coverage = self.provider.get_coverage(
             self.id, limit=limit, offset=offset, fields=fields, include_history=include_history, **kwargs
         )
@@ -443,6 +483,11 @@ class Dataset:
         >>> weather = Dataset('WEATHER')
         >>> cities = await weather.get_coverage_async()
         """
+        # TODO : setup provider later
+        if self.__provider is None:
+            rows = self._mock_coverage_rows(limit, offset, fields, include_history)
+            return pd.DataFrame(rows)
+
         coverage = await self.provider.get_coverage_async(
             self.id, limit=limit, offset=offset, fields=fields, include_history=include_history, **kwargs
         )
