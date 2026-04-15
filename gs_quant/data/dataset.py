@@ -47,6 +47,37 @@ from gs_quant.target.data import (
 class InvalidInputException(Exception):
     pass
 
+# TODO : Remove this once we have a real provider
+# Illustrative coverage when there is no API session (see Dataset.get_coverage).
+_MOCK_EDRVOL_PERCENT_STANDARD_HISTORY_START = '2018-06-03'
+_MOCK_EDRVOL_PERCENT_STANDARD_COVERAGE_SPECS = (
+    ('AEX', 'MA4B66MW5E27U8NN8LS', 'AEX Index'),
+    ('IBOV', 'MA4B66MW5E27UBRVOL1', 'Brazil Ibovespa Index'),
+    ('INDU', 'MA4B66MW5E27UDJIA01', 'Dow Jones Industrial Average'),
+    ('CAC', 'MA4B66MW5E27UCAC401', 'CAC 40 Index'),
+    ('UKX', 'MA4B66MW5E27UFTSE01', 'FTSE 100 Index'),
+    ('DAX', 'MA4B66MW5E27UDAX001', 'DAX Index'),
+    ('HSCEI', 'MA4B66MW5E27UHSCEI1', 'Hang Seng China Enterprises Index'),
+    ('HSI', 'MA4B66MW5E27UHSI001', 'Hang Seng Index'),
+    ('KOSPI2', 'MA4B66MW5E27UKOSP21', 'KOSPI 200 Index'),
+    ('MXEA', 'MA4B66MW5E27UMXEA01', 'MSCI EAFE Index'),
+    ('MXEF', 'MA4B66MW5E27UMXEF01', 'MSCI Emerging Markets Index'),
+    ('MEXBOL', 'MA4B66MW5E27UMEXB01', 'S&P/BMV IPC Index'),
+    ('NKY', 'MA4B66MW5E27UN22501', 'Nikkei 225 Index'),
+    ('NDX', 'MA4B66MW5E27UNDX001', 'NASDAQ-100 Index'),
+    ('RTY', 'MA4B66MW5E27URUTY01', 'Russell 2000 Index'),
+    ('SPTSX60', 'MA4B66MW5E27UTSX601', 'S&P/TSX 60 Index'),
+    ('SPX', 'MA4B66MW5E27USPX001', 'S&P 500 Index'),
+    ('SMI', 'MA4B66MW5E27USMI001', 'Swiss Market Index'),
+    ('SX5E', 'MA4B66MW5E27USX5E01', 'EURO STOXX 50 Index'),
+    ('TPX', 'MA4B66MW5E27UTOPX01', 'TOPIX Index'),
+    ('EEM UP', 'MA4B66MW5E27UEEM01', 'iShares MSCI Emerging Markets ETF'),
+    ('EFA UP', 'MA4B66MW5E27UEFA01', 'iShares MSCI EAFE ETF'),
+    ('GLD UP', 'MA4B66MW5E27UGLD01', 'SPDR Gold Shares'),
+    ('XLF UP', 'MA4B66MW5E27UXLF01', 'Financial Select Sector SPDR Fund'),
+    ('XLK UP', 'MA4B66MW5E27UXLK01', 'Technology Select Sector SPDR Fund'),
+)
+
 
 class Dataset:
     """A collection of related data"""
@@ -409,15 +440,30 @@ class Dataset:
         include_history: bool,
     ) -> List[Dict]:
         """Placeholder coverage when no provider is configured (no live API session)."""
-        row: Dict = {
-            'assetId': f'MOCK-{self.id}',
-            'name': f'Mock coverage row for dataset {self.id}',
-        }
-        if include_history:
-            row['historyStartDate'] = '2020-01-01'
-        if fields:
-            row = {f: row.get(f, f'mock_{f}') for f in fields}
-        rows = [row]
+        if self.id == Dataset.GS.EDRVOL_PERCENT_STANDARD.value:
+            rows = []
+            for bbid, asset_id, name in _MOCK_EDRVOL_PERCENT_STANDARD_COVERAGE_SPECS:
+                row: Dict = {
+                    'bbid': bbid,
+                    'assetId': asset_id,
+                    'name': name,
+                }
+                if include_history:
+                    row['historyStartDate'] = _MOCK_EDRVOL_PERCENT_STANDARD_HISTORY_START
+                if fields:
+                    row = {f: row.get(f, f'mock_{f}') for f in fields}
+                rows.append(row)
+        else:
+            row = {
+                'bbid': 'MOCK',
+                'assetId': f'MOCK-{self.id}',
+                'name': f'Mock coverage row for dataset {self.id}',
+            }
+            if include_history:
+                row['historyStartDate'] = '2020-01-01'
+            if fields:
+                row = {f: row.get(f, f'mock_{f}') for f in fields}
+            rows = [row]
         if offset:
             rows = rows[offset:]
         if limit is not None:

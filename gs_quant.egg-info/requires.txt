@@ -35,6 +35,7 @@ pytest-cov
 pytest-mock
 pytest-order
 testfixtures
+matplotlib
 
 [internal]
 gs-quant-internal

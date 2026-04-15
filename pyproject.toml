@@ -85,6 +85,7 @@ develop = [
     "pytest-mock",
     "pytest-order",
     "testfixtures",
+    "matplotlib",
 ]
 
 [project.urls]
@@ -114,6 +115,7 @@ dev = [
     "pytest-mock",
     "pytest-order",
     "testfixtures",
+    "matplotlib",
 ]
 
 [tool.setuptools]
