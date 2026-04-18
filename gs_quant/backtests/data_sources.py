@@ -18,9 +18,10 @@ from dataclasses import dataclass, field
 from dataclasses_json import dataclass_json, config
 import datetime as dt
 from enum import Enum
+import sqlite3
 import numpy as np
 import pandas as pd
-from typing import Union, Iterable, ClassVar, List
+from typing import Union, Iterable, ClassVar, List, Optional
 
 from gs_quant.backtests.core import ValuationFixingType
 from gs_quant.base import field_metadata, static_field
@@ -169,6 +170,75 @@ class GenericDataSource(DataSource):
         if isinstance(end, int):
             return self.data_set.loc[self.data_set.index < start].tail(end)
         return self.data_set.loc[(start < self.data_set.index) & (self.data_set.index <= end)]
+
+
+@dataclass_json
+@dataclass
+class SQLiteDataSource(DataSource):
+    """
+    Loads a time series from a SQLite database using pandas (`read_sql_query`) and exposes it as a
+    :class:`DataSource` for triggers and :class:`DataManager` (same contract as :class:`GenericDataSource`).
+
+    The SQL should return at least two columns: a date/datetime column and a numeric value column
+    (defaults: first column = dates, first remaining column = values). Duplicate timestamps keep the
+    last row.
+
+    :param db_path: Path to the SQLite database file (for example ``market.db``).
+    :param sql: SQL string passed to :func:`pandas.read_sql_query`.
+    :param date_column: Name of the date/datetime column; if omitted, the first column is used.
+    :param value_column: Name of the value column; if omitted, the first column after the date column is used.
+    :param missing_data_strategy: Same semantics as :class:`GenericDataSource` for :meth:`get_data`.
+    """
+
+    db_path: str
+    sql: str
+    date_column: Optional[str] = None
+    value_column: Optional[str] = None
+    missing_data_strategy: MissingDataStrategy = field(default=MissingDataStrategy.fail, metadata=field_metadata)
+    class_type: str = static_field('sqlite_data_source')
+
+    def __post_init__(self):
+        self._wrapped: Optional[GenericDataSource] = None
+
+    def _ensure_wrapped(self) -> GenericDataSource:
+        if self._wrapped is not None:
+            return self._wrapped
+        with sqlite3.connect(self.db_path) as conn:
+            df = pd.read_sql_query(self.sql, conn)
+        if df.empty:
+            raise RuntimeError('SQLite query returned no rows; cannot build time series.')
+        date_col = self.date_column or df.columns[0]
+        if date_col not in df.columns:
+            raise ValueError(f'date_column {date_col!r} not in query columns {list(df.columns)}')
+        value_candidates = [c for c in df.columns if c != date_col]
+        if self.value_column is not None:
+            if self.value_column not in df.columns:
+                raise ValueError(f'value_column {self.value_column!r} not in query columns {list(df.columns)}')
+            value_col = self.value_column
+        elif value_candidates:
+            value_col = value_candidates[0]
+        else:
+            raise ValueError('Could not infer value column; specify value_column or return a value column in SQL.')
+        idx = pd.to_datetime(df[date_col])
+        series = pd.Series(df[value_col].to_numpy(), index=idx, name=value_col)
+        series = series[~series.index.duplicated(keep='last')].sort_index()
+        self._wrapped = GenericDataSource(series, self.missing_data_strategy)
+        return self._wrapped
+
+    def get_data(self, state: Union[dt.date, dt.datetime, Iterable] = None, **kwargs):
+        return self._ensure_wrapped().get_data(state)
+
+    def get_data_range(
+        self,
+        start: Union[dt.date, dt.datetime],
+        end: Union[dt.date, dt.datetime, int],
+        **kwargs,
+    ):
+        wrapped = self._ensure_wrapped()
+        start_ts = pd.Timestamp(start)
+        if isinstance(end, int):
+            return wrapped.get_data_range(start_ts, end)
+        return wrapped.get_data_range(start_ts, pd.Timestamp(end))
 
 
 @dataclass_json
