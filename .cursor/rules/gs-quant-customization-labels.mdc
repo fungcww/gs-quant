@@ -1,0 +1,39 @@
+---
+description: Label fork-specific logic with # customization above changes to upstream gs-quant
+alwaysApply: true
+---
+
+# gs-quant fork: customization markers
+
+This repository extends upstream **gs-quant**. Any logic that is **not** part of the original library behavior must be easy to find when diffing or reviewing.
+
+## Python (`.py`)
+
+Place **`# customization`** on the line **immediately above** the customized block, function, class, or non-trivial branch. Optionally add a short same-line note after the marker.
+
+```python
+# customization: local SQLite cache for offline runs
+def _load_from_shared_data(...):
+    ...
+```
+
+```python
+# customization
+if use_local_runner:
+    ...
+```
+
+- Use **one marker per contiguous customized region**; if the region spans many lines, a single leading `# customization` at the top is enough.
+- Do **not** use the marker for trivial formatting-only edits; use it when behavior or public API differs from stock gs-quant.
+
+## Notebooks (`.ipynb`)
+
+Start the cell (or the edited portion) with `# customization` in the first code line, or add a short markdown cell above the change stating **Customization** and what it does.
+
+## Shell and config
+
+For `*.sh`, `Dockerfile`, `*.yaml`, `*.toml`, etc., use that format’s comment syntax with the same **`customization`** keyword (e.g. `# customization` in shell, `# customization` in Dockerfile where `#` applies).
+
+## When editing
+
+When adding or changing fork-specific behavior, **add or update the marker** so future merges from upstream and code search for `customization` surface all local deltas.

@@ -171,7 +171,7 @@ class GenericDataSource(DataSource):
             return self.data_set.loc[self.data_set.index < start].tail(end)
         return self.data_set.loc[(start < self.data_set.index) & (self.data_set.index <= end)]
 
-
+# customization
 @dataclass_json
 @dataclass
 class SQLiteDataSource(DataSource):
@@ -187,6 +187,9 @@ class SQLiteDataSource(DataSource):
     :param sql: SQL string passed to :func:`pandas.read_sql_query`.
     :param date_column: Name of the date/datetime column; if omitted, the first column is used.
     :param value_column: Name of the value column; if omitted, the first column after the date column is used.
+    :param index_at_time: If set, each calendar date from the query is combined with this clock time (for example
+        EOD :class:`datetime.time` matching :class:`PredefinedAssetEngine` valuation time) so that
+        :meth:`get_data` matches :class:`~datetime.datetime` states from the engine.
     :param missing_data_strategy: Same semantics as :class:`GenericDataSource` for :meth:`get_data`.
     """
 
@@ -194,6 +197,7 @@ class SQLiteDataSource(DataSource):
     sql: str
     date_column: Optional[str] = None
     value_column: Optional[str] = None
+    index_at_time: Optional[dt.time] = field(default=None, metadata=field_metadata)
     missing_data_strategy: MissingDataStrategy = field(default=MissingDataStrategy.fail, metadata=field_metadata)
     class_type: str = static_field('sqlite_data_source')
 
@@ -220,6 +224,12 @@ class SQLiteDataSource(DataSource):
         else:
             raise ValueError('Could not infer value column; specify value_column or return a value column in SQL.')
         idx = pd.to_datetime(df[date_col])
+        if self.index_at_time is not None:
+            idx = pd.DatetimeIndex(
+                [dt.datetime.combine(pd.Timestamp(ts).date(), self.index_at_time) for ts in idx]
+            )
+        else:
+            idx = pd.DatetimeIndex(idx)
         series = pd.Series(df[value_col].to_numpy(), index=idx, name=value_col)
         series = series[~series.index.duplicated(keep='last')].sort_index()
         self._wrapped = GenericDataSource(series, self.missing_data_strategy)

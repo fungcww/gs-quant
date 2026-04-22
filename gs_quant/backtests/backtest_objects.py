@@ -896,6 +896,12 @@ class PredefinedAssetBacktest(BaseBacktest):
             [order.to_dict(self.data_handler) for order in self.orders if order.execution_end_time().date() == date]
         )
 
+# customization
+    @property
+    def result_summary(self) -> pd.DataFrame:
+        return pd.DataFrame({BackTest.TOTAL_COLUMN: self.performance})
+# end customization
+
 
 @dataclass_json
 @dataclass

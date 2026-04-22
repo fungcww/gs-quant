@@ -1,3 +1,7 @@
 *.pyc
 gs_quant/.idea/
 research_results/*
+
+# Local research data (SQLite and other large, regenerable datasets)
+shared_data/
+*.db
