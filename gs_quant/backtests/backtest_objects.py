@@ -883,11 +883,12 @@ class PredefinedAssetBacktest(BaseBacktest):
     def get_level(self, date: dt.date) -> float:
         return self.performance[date]
 
+    # customization: OrderCost.execution_quantity has no data_handler arg (unlike other order types)
     def get_costs(self) -> pd.Series(dtype=float):
         costs = defaultdict(float)
         for order in self.orders:
             if isinstance(order, OrderCost):
-                costs[order.execution_end_time().date()] += order.execution_quantity(self.data_handler)
+                costs[order.execution_end_time().date()] += order.quantity
 
         return pd.Series(costs)
 
@@ -896,10 +897,17 @@ class PredefinedAssetBacktest(BaseBacktest):
             [order.to_dict(self.data_handler) for order in self.orders if order.execution_end_time().date() == date]
         )
 
-# customization
+# customization: richer summary for local PredefinedAssetEngine runs (NAV + fee drag)
     @property
     def result_summary(self) -> pd.DataFrame:
-        return pd.DataFrame({BackTest.TOTAL_COLUMN: self.performance})
+        costs = self.get_costs()
+        cum_tc = costs.sort_index().cumsum().reindex(self.performance.index).ffill().fillna(0.0)
+        return pd.DataFrame(
+            {
+                'Total NAV': self.performance,
+                'Cumulative Transaction Costs': cum_tc,
+            }
+        )
 # end customization
 
 
