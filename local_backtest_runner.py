@@ -3,7 +3,7 @@
 """
 Local backtest using PredefinedAssetEngine + SQLiteDataSource (no GsSession / Marquee pricing).
 
-- Synthetic AAPL close path: geometric random walk (trending) for indicator realism.
+- Real daily OHLC history for AAPL and SMR via yfinance, persisted to ``market.db``.
 - MA crossover vs 20-day SMA: enter on bullish cross (price crosses above SMA); exit when close < SMA.
 - Logic gates: buy only when flat; sell full position on exit signal.
 - Per-trade fees via OrderCost so result_summary shows cumulative transaction costs.
@@ -22,10 +22,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
-from gs_quant.backtests.data_sources import DataManager, SQLiteDataSource
+from gs_quant.backtests.data_sources import DataManager, MissingDataStrategy, SQLiteDataSource
 from gs_quant.backtests.core import ValuationFixingType
 from gs_quant.backtests.order import OrderAtMarket, OrderCost
 from gs_quant.backtests.predefined_asset_engine import PredefinedAssetEngine
@@ -39,10 +38,21 @@ from gs_quant.timeseries.technicals import moving_average
 # PredefinedAssetEngine uses this wall-clock time for market/valuation events by default.
 _EOD = dt.time(23, 0, 0)
 
+_TICKERS = ("AAPL", "SMR")
+_DATA_START = "2024-01-01"
+_DATA_END_EXCLUSIVE = "2026-01-01"  # yfinance daily ``end`` is exclusive; includes all of 2025-12-31
+
 AAPL_SQL = """
 SELECT date, close_price
 FROM market_history
 WHERE symbol = 'AAPL'
+ORDER BY date
+"""
+
+SMR_SQL = """
+SELECT date, close_price
+FROM market_history
+WHERE symbol = 'SMR'
 ORDER BY date
 """
 
@@ -51,15 +61,33 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-def ensure_market_db(db_path: Path, *, seed: int | None = 42) -> None:
-    """Create ``market_history`` if needed and (re)write AAPL closes as a geometric random walk for the demo year."""
+def ensure_market_db(db_path: Path) -> None:
+    """Create ``market_history`` if needed and load AAPL/SMR daily closes from yfinance into ``market.db``."""
+    try:
+        import yfinance as yf  # type: ignore[import-untyped]
+    except ImportError as e:
+        raise RuntimeError(
+            "yfinance is required for real-world data ingestion. Install with: pip install yfinance"
+        ) from e
+
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(seed)
-    days = pd.bdate_range("2024-01-01", "2024-12-31")
-    # customization: geometric random walk with mild upward drift so the series trends
-    log_ret = rng.normal(loc=0.0004, scale=0.012, size=len(days))
-    log_level = np.log(150.0) + np.cumsum(log_ret)
-    closes = np.exp(log_level)
+    rows: list[tuple[str, str, float, int]] = []
+
+    for symbol in _TICKERS:
+        hist = yf.Ticker(symbol).history(start=_DATA_START, end=_DATA_END_EXCLUSIVE, auto_adjust=False)
+        if hist.empty:
+            raise RuntimeError(f"yfinance returned no rows for {symbol!r}; check connectivity or ticker.")
+        for ts, bar in hist.iterrows():
+            close = bar.get("Close")
+            if close is None or (isinstance(close, float) and pd.isna(close)):
+                continue
+            vol = bar.get("Volume", 0)
+            if vol is None or (isinstance(vol, float) and pd.isna(vol)):
+                v_int = 0
+            else:
+                v_int = int(vol)
+            d = pd.Timestamp(ts).date().strftime("%Y-%m-%d")
+            rows.append((d, symbol, float(close), v_int))
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -73,15 +101,13 @@ def ensure_market_db(db_path: Path, *, seed: int | None = 42) -> None:
             )
             """
         )
-        for i, day in enumerate(days):
-            d = day.date()
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO market_history (date, symbol, close_price, volume)
-                VALUES (?, 'AAPL', ?, ?)
-                """,
-                (d.strftime("%Y-%m-%d"), float(closes[i]), 1_000_000),
-            )
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO market_history (date, symbol, close_price, volume)
+            VALUES (?, ?, ?, ?)
+            """,
+            rows,
+        )
         conn.commit()
 
 
@@ -118,23 +144,24 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         return [self._eod]
 
     def generate_orders(self, state: dt.datetime, backtest=None):
-        d = pd.Timestamp(state.date())
-        if d not in self._closes.index:
+        d = pd.Timestamp(state.date()).normalize()
+        idx_arr = self._closes.index.get_indexer([d], method=None)
+        i = int(idx_arr[0]) if len(idx_arr) else -1
+        if i < 0 or i < 1:
             return []
 
-        i = int(self._closes.index.get_loc(d))
-        if i < 1:
+        try:
+            close_t = float(self._closes.iloc[i])
+            sma_t_raw = self._sma.iloc[i]
+            close_prev = float(self._closes.iloc[i - 1])
+            sma_prev_raw = self._sma.iloc[i - 1]
+        except (KeyError, IndexError, TypeError):
             return []
 
-        close_t = float(self._closes.iloc[i])
-        sma_t = self._sma.loc[d]
-        if pd.isna(sma_t):
+        if pd.isna(sma_t_raw) or pd.isna(sma_prev_raw):
             return []
-        sma_t = float(sma_t)
-        close_prev = float(self._closes.iloc[i - 1])
-        sma_prev = float(self._sma.iloc[i - 1])
-        if pd.isna(sma_prev):
-            return []
+        sma_t = float(sma_t_raw)
+        sma_prev = float(sma_prev_raw)
 
         pos = backtest.holdings.get(self._instrument, 0.0) if backtest is not None else 0.0
         orders: list = []
@@ -169,22 +196,40 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         return orders
 
 
-def _load_aapl_close_series(db_path: Path) -> pd.Series:
+def _load_close_series(db_path: Path, sql: str) -> pd.Series:
     with sqlite3.connect(db_path) as conn:
-        df = pd.read_sql_query(AAPL_SQL, conn)
+        df = pd.read_sql_query(sql, conn)
     idx = pd.to_datetime(df["date"]).dt.normalize()
     return pd.Series(df["close_price"].to_numpy(), index=idx, name="close_price").sort_index()
 
 
-def run(start: dt.date, end: dt.date, db_path: Path, *, seed: int | None) -> None:
-    ensure_market_db(db_path, seed=seed)
-    close_series = _load_aapl_close_series(db_path)
+def _nav_total_return_and_max_drawdown(nav: pd.Series) -> tuple[float, float]:
+    """Return (total_return_pct, max_drawdown_pct) for Total NAV; max drawdown is worst peak-to-trough return in %."""
+    nav = nav.astype(float).dropna()
+    if nav.empty:
+        return float("nan"), float("nan")
+    initial = float(nav.iloc[0])
+    final = float(nav.iloc[-1])
+    total_ret = (final / initial - 1.0) * 100.0 if abs(initial) > 1e-12 else float("nan")
+    running_max = nav.cummax()
+    rel = nav / running_max - 1.0
+    max_dd_pct = float(rel.min() * 100.0)
+    return total_ret, max_dd_pct
 
+
+def run(start: dt.date, end: dt.date, db_path: Path) -> None:
+    ensure_market_db(db_path)
+    close_aapl = _load_close_series(db_path, AAPL_SQL)
+    close_smr = _load_close_series(db_path, SMR_SQL)
+
+    # fill_forward: engine marks to market on calendar days (e.g. holidays) and RT series uses EOD clock, not midnight
+    _mds = MissingDataStrategy.fill_forward
     apple_daily = SQLiteDataSource(
         db_path=str(db_path),
         sql=AAPL_SQL,
         date_column="date",
         value_column="close_price",
+        missing_data_strategy=_mds,
     )
     apple_rt = SQLiteDataSource(
         db_path=str(db_path),
@@ -192,22 +237,48 @@ def run(start: dt.date, end: dt.date, db_path: Path, *, seed: int | None) -> Non
         date_column="date",
         value_column="close_price",
         index_at_time=_EOD,
+        missing_data_strategy=_mds,
+    )
+    smr_daily = SQLiteDataSource(
+        db_path=str(db_path),
+        sql=SMR_SQL,
+        date_column="date",
+        value_column="close_price",
+        missing_data_strategy=_mds,
+    )
+    smr_rt = SQLiteDataSource(
+        db_path=str(db_path),
+        sql=SMR_SQL,
+        date_column="date",
+        value_column="close_price",
+        index_at_time=_EOD,
+        missing_data_strategy=_mds,
     )
 
     aapl = EqStock(name="AAPL", currency="USD", quantity=100)
+    smr = EqStock(name="SMR", currency="USD", quantity=100)
 
     data_manager = DataManager()
     data_manager.add_data_source(apple_daily, DataFrequency.DAILY, aapl, ValuationFixingType.PRICE)
     data_manager.add_data_source(apple_rt, DataFrequency.REAL_TIME, aapl, ValuationFixingType.PRICE)
+    data_manager.add_data_source(smr_daily, DataFrequency.DAILY, smr, ValuationFixingType.PRICE)
+    data_manager.add_data_source(smr_rt, DataFrequency.REAL_TIME, smr, ValuationFixingType.PRICE)
 
-    mac_trigger = MACrossoverEODTrigger(
+    mac_aapl = MACrossoverEODTrigger(
         aapl,
-        close_series,
+        close_aapl,
         trade_quantity=float(aapl.quantity),
         sma_window=20,
         fee_per_leg_usd=25.0,
     )
-    strategy = Strategy(initial_portfolio=None, triggers=[mac_trigger])
+    mac_smr = MACrossoverEODTrigger(
+        smr,
+        close_smr,
+        trade_quantity=float(smr.quantity),
+        sma_window=20,
+        fee_per_leg_usd=25.0,
+    )
+    strategy = Strategy(initial_portfolio=None, triggers=[mac_aapl, mac_smr])
 
     engine = PredefinedAssetEngine(data_mgr=data_manager)
     backtest = engine.run_backtest(strategy, start=start, end=end, initial_value=50_000_000.0)
@@ -219,6 +290,10 @@ def run(start: dt.date, end: dt.date, db_path: Path, *, seed: int | None) -> Non
     if len(summary):
         print("Final Total NAV:", float(summary["Total NAV"].iloc[-1]))
         print("Final Cumulative Transaction Costs:", float(summary["Cumulative Transaction Costs"].iloc[-1]))
+        tr, mdd = _nav_total_return_and_max_drawdown(summary["Total NAV"])
+        print(f"Total Return % (Total NAV): {tr:.4f}%")
+        # mdd is the worst (nav/peak - 1)*100, <= 0; report magnitude as conventional "max drawdown %"
+        print(f"Maximum Drawdown % (Total NAV): {abs(mdd):.4f}%")
     print("Orders generated:", len(backtest.orders))
     print("Done (no GsSession).")
 
@@ -228,7 +303,7 @@ def main() -> None:
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="Use a one-week window instead of full-year 2024",
+        help="Use a one-week window instead of the full configured range",
     )
     parser.add_argument(
         "--db",
@@ -236,19 +311,13 @@ def main() -> None:
         default=_repo_root() / "shared_data" / "market.db",
         help="Path to SQLite file (default: ./shared_data/market.db)",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="RNG seed for the random-walk prices (use a different integer to resample paths)",
-    )
     args = parser.parse_args()
     if args.quick:
         start, end = dt.date(2024, 6, 3), dt.date(2024, 6, 7)
     else:
-        start, end = dt.date(2024, 1, 1), dt.date(2024, 12, 31)
+        start, end = dt.date(2024, 1, 1), dt.date(2025, 12, 31)
     try:
-        run(start, end, args.db.resolve(), seed=args.seed)
+        run(start, end, args.db.resolve())
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         raise

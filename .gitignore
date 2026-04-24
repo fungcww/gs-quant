@@ -1,4 +1,9 @@
 *.pyc
+build/
+dist/
+*.egg-info/
+gs_quant.egg-info/
+
 gs_quant/.idea/
 research_results/*
 
