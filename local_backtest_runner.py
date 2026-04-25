@@ -6,7 +6,7 @@ Local backtest using PredefinedAssetEngine + SQLiteDataSource (no GsSession / Ma
 - Real daily OHLC history for AAPL and SMR via yfinance, persisted to ``market.db``.
 - MA crossover vs 20-day SMA: enter on bullish cross (price crosses above SMA); exit when close < SMA.
 - Logic gates: buy only when flat; sell full position on exit signal.
-- Per-trade fees via OrderCost so result_summary shows cumulative transaction costs.
+- Per-trade fees via OrderCost (Futu-style US stock estimate) so result_summary shows cumulative transaction costs.
 
 Run from the repository root::
 
@@ -34,6 +34,14 @@ from gs_quant.data.core import DataFrequency
 from gs_quant.instrument import EqStock
 from gs_quant.timeseries.helper import Window
 from gs_quant.timeseries.technicals import moving_average
+
+# customization: research-framework utilities (sweep, sharpe, plots)
+import math
+
+import matplotlib as mpl
+
+mpl.use("Agg")
+import matplotlib.pyplot as plt
 
 # PredefinedAssetEngine uses this wall-clock time for market/valuation events by default.
 _EOD = dt.time(23, 0, 0)
@@ -114,7 +122,7 @@ def ensure_market_db(db_path: Path) -> None:
 class MACrossoverEODTrigger(OrdersGeneratorTrigger):
     """
     20-day SMA barrier: buy on bullish crossover (close crosses above SMA) when flat;
-    sell entire long when close < SMA. Optional fixed fee per routed order leg via OrderCost.
+    sell entire long when close < SMA. Brokerage-style fees per routed order leg via OrderCost.
     """
 
     def __init__(
@@ -122,9 +130,9 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         instrument: EqStock,
         close_series: pd.Series,
         *,
-        trade_quantity: float = 100.0,
+        target_usd_allocation: float = 25_000.0,
         sma_window: int = 20,
-        fee_per_leg_usd: float = 25.0,
+        fee_model: str = "futu_us_stock",
         eod: dt.time = _EOD,
     ):
         super().__init__()
@@ -135,13 +143,21 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         # customization: use library SMA; Window(w, w-1) keeps ramp aligned with strict w-point average (vs int w alone)
         ramp = max(0, sma_window - 1)
         self._sma = moving_average(self._closes, Window(sma_window, ramp)).reindex(self._closes.index)
-        self._trade_qty = trade_quantity
-        self._fee = fee_per_leg_usd
+        # customization: equal-dollar sizing per entry (shares derived from signal-day close)
+        self._target_usd = float(target_usd_allocation)
+        self._fee_model = str(fee_model)
         self._eod = eod
         self._eps = 1e-9
+        if self._fee_model not in {"futu_us_stock", "none"}:
+            raise ValueError(f"Unsupported fee_model={self._fee_model!r}; expected 'futu_us_stock' or 'none'.")
 
     def get_trigger_times(self) -> list:
         return [self._eod]
+
+    def _execution_fee_usd(self, *, shares: float, price: float, side: str) -> float:
+        if self._fee_model == "none":
+            return 0.0
+        return _futu_us_stock_order_fee_usd(shares=float(shares), price=float(price), side=str(side))
 
     def generate_orders(self, state: dt.datetime, backtest=None):
         d = pd.Timestamp(state.date()).normalize()
@@ -169,16 +185,23 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         if pos <= self._eps:
             # customization: only buy when flat; classic bullish MA cross
             if close_prev <= sma_prev and close_t > sma_t:
+                if close_t <= self._eps or self._target_usd <= self._eps:
+                    return []
+                qty = math.floor(self._target_usd / close_t)
+                if qty <= 0:
+                    return []
                 orders.append(
                     OrderAtMarket(
                         instrument=self._instrument,
-                        quantity=self._trade_qty,
+                        quantity=float(qty),
                         generation_time=state,
                         execution_datetime=state,
                         source='MACrossover',
                     )
                 )
-                orders.append(OrderCost('USD', -abs(self._fee), 'MACrossover', state))
+                fee = self._execution_fee_usd(shares=float(qty), price=close_t, side="buy")
+                if fee > self._eps:
+                    orders.append(OrderCost("USD", -abs(fee), "MACrossover", state))
         else:
             if close_t < sma_t:
                 q = -pos
@@ -192,7 +215,9 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
                             source='MACrossover',
                         )
                     )
-                    orders.append(OrderCost('USD', -abs(self._fee), 'MACrossover', state))
+                    fee = self._execution_fee_usd(shares=float(q), price=close_t, side="sell")
+                    if fee > self._eps:
+                        orders.append(OrderCost("USD", -abs(fee), "MACrossover", state))
         return orders
 
 
@@ -217,10 +242,67 @@ def _nav_total_return_and_max_drawdown(nav: pd.Series) -> tuple[float, float]:
     return total_ret, max_dd_pct
 
 
-def run(start: dt.date, end: dt.date, db_path: Path) -> None:
+# customization: model 富途牛牛 (Futu) US-stock order fees (approx)
+def _futu_us_stock_order_fee_usd(
+    *,
+    shares: float,
+    price: float,
+    side: str,
+    commission_per_share: float = 0.0049,
+    commission_min: float = 0.99,
+    platform_per_share: float = 0.005,
+    platform_min: float = 1.00,
+    settlement_per_share: float = 0.003,
+    taf_per_share: float = 0.000166,
+    taf_min: float = 0.01,
+    taf_max: float = 8.30,
+    sec_fee_rate: float = 0.0,
+) -> float:
+    """
+    Estimate 富途牛牛 US-stock fees per filled order leg.
+
+    Assumptions (research approximation):
+    - Commission + platform fee + settlement fee apply on both buy/sell.
+    - FINRA TAF applies on sells only.
+    - SEC fee is set to 0 by default (reported cancelled since 2025-05-14); set `sec_fee_rate` if needed.
+    """
+    qty = abs(float(shares))
+    px = float(price)
+    if qty <= 0 or px <= 0:
+        return 0.0
+
+    commission = max(commission_min, commission_per_share * qty)
+    platform = max(platform_min, platform_per_share * qty)
+    settlement = settlement_per_share * qty
+
+    sell_extras = 0.0
+    if side.lower() == "sell":
+        taf = min(taf_max, max(taf_min, taf_per_share * qty))
+        sec = sec_fee_rate * (qty * px) if sec_fee_rate > 0 else 0.0
+        sell_extras = taf + sec
+
+    return float(commission + platform + settlement + sell_extras)
+
+
+def _annualized_sharpe_from_nav(nav: pd.Series, annualization_factor: int = 252) -> float:
+    nav = nav.astype(float).dropna()
+    if len(nav) < 3:
+        return float("nan")
+    rets = nav.pct_change().dropna()
+    if rets.empty:
+        return float("nan")
+    vol = float(rets.std())
+    if vol <= 0:
+        return float("nan")
+    return float(math.sqrt(annualization_factor) * float(rets.mean()) / vol)
+
+
+def _build_data_manager(db_path: Path) -> tuple[DataManager, dict[str, pd.Series], dict[str, EqStock]]:
     ensure_market_db(db_path)
-    close_aapl = _load_close_series(db_path, AAPL_SQL)
-    close_smr = _load_close_series(db_path, SMR_SQL)
+    close_by_symbol = {
+        "AAPL": _load_close_series(db_path, AAPL_SQL),
+        "SMR": _load_close_series(db_path, SMR_SQL),
+    }
 
     # fill_forward: engine marks to market on calendar days (e.g. holidays) and RT series uses EOD clock, not midnight
     _mds = MissingDataStrategy.fill_forward
@@ -255,46 +337,130 @@ def run(start: dt.date, end: dt.date, db_path: Path) -> None:
         missing_data_strategy=_mds,
     )
 
-    aapl = EqStock(name="AAPL", currency="USD", quantity=100)
-    smr = EqStock(name="SMR", currency="USD", quantity=100)
+    instruments = {
+        "AAPL": EqStock(name="AAPL", currency="USD", quantity=1),
+        "SMR": EqStock(name="SMR", currency="USD", quantity=1),
+    }
 
     data_manager = DataManager()
-    data_manager.add_data_source(apple_daily, DataFrequency.DAILY, aapl, ValuationFixingType.PRICE)
-    data_manager.add_data_source(apple_rt, DataFrequency.REAL_TIME, aapl, ValuationFixingType.PRICE)
-    data_manager.add_data_source(smr_daily, DataFrequency.DAILY, smr, ValuationFixingType.PRICE)
-    data_manager.add_data_source(smr_rt, DataFrequency.REAL_TIME, smr, ValuationFixingType.PRICE)
+    data_manager.add_data_source(apple_daily, DataFrequency.DAILY, instruments["AAPL"], ValuationFixingType.PRICE)
+    data_manager.add_data_source(apple_rt, DataFrequency.REAL_TIME, instruments["AAPL"], ValuationFixingType.PRICE)
+    data_manager.add_data_source(smr_daily, DataFrequency.DAILY, instruments["SMR"], ValuationFixingType.PRICE)
+    data_manager.add_data_source(smr_rt, DataFrequency.REAL_TIME, instruments["SMR"], ValuationFixingType.PRICE)
 
-    mac_aapl = MACrossoverEODTrigger(
-        aapl,
-        close_aapl,
-        trade_quantity=float(aapl.quantity),
-        sma_window=20,
-        fee_per_leg_usd=25.0,
-    )
-    mac_smr = MACrossoverEODTrigger(
-        smr,
-        close_smr,
-        trade_quantity=float(smr.quantity),
-        sma_window=20,
-        fee_per_leg_usd=25.0,
-    )
-    strategy = Strategy(initial_portfolio=None, triggers=[mac_aapl, mac_smr])
+    return data_manager, close_by_symbol, instruments
 
+
+def _run_single_sma_window(
+    *,
+    start: dt.date,
+    end: dt.date,
+    data_manager: DataManager,
+    close_by_symbol: dict[str, pd.Series],
+    instruments: dict[str, EqStock],
+    sma_window: int,
+    target_usd_allocation: float,
+    fee_model: str,
+    initial_value: float,
+):
+    triggers = [
+        MACrossoverEODTrigger(
+            instruments[symbol],
+            close_by_symbol[symbol],
+            target_usd_allocation=target_usd_allocation,
+            sma_window=int(sma_window),
+            fee_model=str(fee_model),
+        )
+        for symbol in instruments.keys()
+    ]
+    strategy = Strategy(initial_portfolio=None, triggers=triggers)
     engine = PredefinedAssetEngine(data_mgr=data_manager)
-    backtest = engine.run_backtest(strategy, start=start, end=end, initial_value=50_000_000.0)
-
+    backtest = engine.run_backtest(strategy, start=start, end=end, initial_value=float(initial_value))
     summary = backtest.result_summary
-    print(summary.tail(12))
-    print("---")
-    print("Rows in result_summary:", len(summary))
-    if len(summary):
-        print("Final Total NAV:", float(summary["Total NAV"].iloc[-1]))
-        print("Final Cumulative Transaction Costs:", float(summary["Cumulative Transaction Costs"].iloc[-1]))
-        tr, mdd = _nav_total_return_and_max_drawdown(summary["Total NAV"])
+    nav = summary["Total NAV"] if "Total NAV" in summary else pd.Series(dtype=float)
+    sharpe = _annualized_sharpe_from_nav(nav)
+    return backtest, summary, nav, sharpe
+
+
+def run(
+    start: dt.date,
+    end: dt.date,
+    db_path: Path,
+    *,
+    sma_windows: list[int] | None = None,
+    target_usd_allocation: float = 25_000.0,
+    fee_model: str = "futu_us_stock",
+    initial_value: float = 50_000_000.0,
+) -> None:
+    sma_windows = sma_windows or [20]
+    data_manager, close_by_symbol, instruments = _build_data_manager(db_path)
+
+    rows: list[dict] = []
+    best_window: int | None = None
+    best_sharpe: float = float("-inf")
+    best_nav: pd.Series | None = None
+
+    for w in sma_windows:
+        backtest, summary, nav, sharpe = _run_single_sma_window(
+            start=start,
+            end=end,
+            data_manager=data_manager,
+            close_by_symbol=close_by_symbol,
+            instruments=instruments,
+            sma_window=int(w),
+            target_usd_allocation=float(target_usd_allocation),
+            fee_model=str(fee_model),
+            initial_value=float(initial_value),
+        )
+
+        tr, mdd = _nav_total_return_and_max_drawdown(nav)
+        final_nav = float(nav.dropna().iloc[-1]) if len(nav.dropna()) else float("nan")
+        final_tc = (
+            float(summary["Cumulative Transaction Costs"].dropna().iloc[-1])
+            if "Cumulative Transaction Costs" in summary and len(summary["Cumulative Transaction Costs"].dropna())
+            else 0.0
+        )
+        rows.append(
+            {
+                "sma_window": int(w),
+                "annualized_sharpe": sharpe,
+                "total_return_pct": tr,
+                "max_drawdown_pct": abs(mdd),
+                "final_total_nav": final_nav,
+                "final_cum_transaction_costs": final_tc,
+                "orders_generated": len(backtest.orders),
+            }
+        )
+
+        if sharpe == sharpe and sharpe > best_sharpe:  # not NaN
+            best_sharpe = sharpe
+            best_window = int(w)
+            best_nav = nav
+
+        print(f"--- SMA window = {int(w)} ---")
+        print(summary.tail(5))
+        print(f"Annualized Sharpe (rf=0): {sharpe:.4f}")
         print(f"Total Return % (Total NAV): {tr:.4f}%")
-        # mdd is the worst (nav/peak - 1)*100, <= 0; report magnitude as conventional "max drawdown %"
         print(f"Maximum Drawdown % (Total NAV): {abs(mdd):.4f}%")
-    print("Orders generated:", len(backtest.orders))
+        print("Orders generated:", len(backtest.orders))
+        print()
+
+    ranking = pd.DataFrame(rows).sort_values(["annualized_sharpe", "total_return_pct"], ascending=[False, False])
+
+    if best_window is not None and best_nav is not None and len(best_nav.dropna()):
+        nav = best_nav.dropna().astype(float)
+        plt.figure(figsize=(10, 5))
+        plt.plot(nav.index, nav.values, linewidth=1.5)
+        plt.title(f"Equity Curve (Best SMA window = {best_window}, Sharpe = {best_sharpe:.4f})")
+        plt.xlabel("Date")
+        plt.ylabel("Total NAV")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("backtest_result.png", dpi=150)
+        plt.close()
+
+    print("=== SMA Window Ranking (by Annualized Sharpe, rf=0) ===")
+    print(ranking.reset_index(drop=True))
     print("Done (no GsSession).")
 
 
@@ -317,7 +483,14 @@ def main() -> None:
     else:
         start, end = dt.date(2024, 1, 1), dt.date(2025, 12, 31)
     try:
-        run(start, end, args.db.resolve())
+        run(
+            start,
+            end,
+            args.db.resolve(),
+            sma_windows=[5, 10, 15, 20, 30, 50],
+            target_usd_allocation=25_000.0,
+            fee_model="futu_us_stock",
+        )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         raise
