@@ -7,11 +7,12 @@ Local backtest using PredefinedAssetEngine + SQLiteDataSource (no GsSession / Ma
 - MA crossover vs 20-day SMA: enter on bullish cross (price crosses above SMA); exit when close < SMA.
 - Logic gates: buy only when flat; sell full position on exit signal.
 - Per-trade fees via OrderCost (Futu-style US stock estimate) so result_summary shows cumulative transaction costs.
+- Stage 5 (default full run): 0.05% slippage on fills, 10% hard stop vs entry, pick best SMA on 2024 only, then report 2024 vs 2025 with that window.
 
 Run from the repository root::
 
-    python local_backtest_runner.py
-    python local_backtest_runner.py --quick   # one week window
+    python local_backtest_runner.py              # Stage 5 retail robustness + comparison table
+    python local_backtest_runner.py --quick   # one week smoke test
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import pandas as pd
 
 from gs_quant.backtests.data_sources import DataManager, MissingDataStrategy, SQLiteDataSource
 from gs_quant.backtests.core import ValuationFixingType
+from gs_quant.backtests.data_handler import DataHandler
 from gs_quant.backtests.order import OrderAtMarket, OrderCost
 from gs_quant.backtests.predefined_asset_engine import PredefinedAssetEngine
 from gs_quant.backtests.strategy import Strategy
@@ -49,6 +51,43 @@ _EOD = dt.time(23, 0, 0)
 _TICKERS = ("AAPL", "SMR")
 _DATA_START = "2024-01-01"
 _DATA_END_EXCLUSIVE = "2026-01-01"  # yfinance daily ``end`` is exclusive; includes all of 2025-12-31
+
+# customization: retail bid-ask — 0.05% adverse selection vs mid on every market fill
+DEFAULT_SLIPPAGE_FRACTION = 0.0005
+
+
+# customization
+class OrderAtMarketWithSlippage(OrderAtMarket):
+    """Market order fill at mid ± slippage (buys pay more, sells receive less)."""
+
+    def __init__(
+        self,
+        instrument,
+        quantity: float,
+        generation_time: dt.datetime,
+        execution_datetime: dt.datetime,
+        source: str,
+        *,
+        slippage_fraction: float = DEFAULT_SLIPPAGE_FRACTION,
+    ):
+        super().__init__(instrument, quantity, generation_time, execution_datetime, source)
+        self._slippage_fraction = float(slippage_fraction)
+
+    def _execution_price(self, data_handler: DataHandler) -> float:
+        if self.executed_price is None:
+            raw = data_handler.get_data(
+                self.execution_datetime, self.instrument, ValuationFixingType.PRICE
+            )
+            q = float(self.quantity)
+            slip = self._slippage_fraction
+            if q > 1e-12:
+                self.executed_price = float(raw * (1.0 + slip))
+            elif q < -1e-12:
+                self.executed_price = float(raw * (1.0 - slip))
+            else:
+                self.executed_price = float(raw)
+        return self.executed_price
+
 
 AAPL_SQL = """
 SELECT date, close_price
@@ -121,8 +160,9 @@ def ensure_market_db(db_path: Path) -> None:
 
 class MACrossoverEODTrigger(OrdersGeneratorTrigger):
     """
-    20-day SMA barrier: buy on bullish crossover (close crosses above SMA) when flat;
-    sell entire long when close < SMA. Brokerage-style fees per routed order leg via OrderCost.
+    SMA barrier: buy on bullish crossover (close crosses above SMA) when flat;
+    sell entire long when close < SMA. Optional hard stop vs entry (retail).
+    Brokerage-style fees per routed order leg via OrderCost; fills use ``OrderAtMarketWithSlippage``.
     """
 
     def __init__(
@@ -134,6 +174,9 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         sma_window: int = 20,
         fee_model: str = "futu_us_stock",
         eod: dt.time = _EOD,
+        # customization: retail robustness (slippage + hard stop vs purchase price)
+        slippage_fraction: float = DEFAULT_SLIPPAGE_FRACTION,
+        stop_loss_fraction: float = 0.10,
     ):
         super().__init__()
         s = close_series.copy()
@@ -148,6 +191,10 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         self._fee_model = str(fee_model)
         self._eod = eod
         self._eps = 1e-9
+        self._slippage_fraction = float(slippage_fraction)
+        self._stop_loss_fraction = float(stop_loss_fraction)
+        # customization: VWAP-style entry reference for stop (mid close × (1 + slip) at buy signal)
+        self._purchase_price: float | None = None
         if self._fee_model not in {"futu_us_stock", "none"}:
             raise ValueError(f"Unsupported fee_model={self._fee_model!r}; expected 'futu_us_stock' or 'none'.")
 
@@ -182,40 +229,56 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         pos = backtest.holdings.get(self._instrument, 0.0) if backtest is not None else 0.0
         orders: list = []
 
+        slip = self._slippage_fraction
+        buy_px_fee = close_t * (1.0 + slip)
+        sell_px_fee = close_t * (1.0 - slip)
+
         if pos <= self._eps:
-            # customization: only buy when flat; classic bullish MA cross
+            # customization: flat — clear entry reference; only buy on bullish MA cross
+            self._purchase_price = None
             if close_prev <= sma_prev and close_t > sma_t:
                 if close_t <= self._eps or self._target_usd <= self._eps:
                     return []
                 qty = math.floor(self._target_usd / close_t)
                 if qty <= 0:
                     return []
+                # customization: stop anchor = effective buy (mid + half-spread proxy)
+                self._purchase_price = buy_px_fee
                 orders.append(
-                    OrderAtMarket(
-                        instrument=self._instrument,
-                        quantity=float(qty),
-                        generation_time=state,
-                        execution_datetime=state,
-                        source='MACrossover',
+                    OrderAtMarketWithSlippage(
+                        self._instrument,
+                        float(qty),
+                        state,
+                        state,
+                        "MACrossover",
+                        slippage_fraction=slip,
                     )
                 )
-                fee = self._execution_fee_usd(shares=float(qty), price=close_t, side="buy")
+                fee = self._execution_fee_usd(shares=float(qty), price=buy_px_fee, side="buy")
                 if fee > self._eps:
                     orders.append(OrderCost("USD", -abs(fee), "MACrossover", state))
         else:
-            if close_t < sma_t:
+            # customization: 10% hard stop below purchase (evaluated on mid close)
+            stop_hit = (
+                self._purchase_price is not None
+                and close_t <= self._purchase_price * (1.0 - self._stop_loss_fraction)
+            )
+            trend_exit = close_t < sma_t
+            if stop_hit or trend_exit:
                 q = -pos
                 if abs(q) > self._eps:
+                    self._purchase_price = None
                     orders.append(
-                        OrderAtMarket(
-                            instrument=self._instrument,
-                            quantity=q,
-                            generation_time=state,
-                            execution_datetime=state,
-                            source='MACrossover',
+                        OrderAtMarketWithSlippage(
+                            self._instrument,
+                            q,
+                            state,
+                            state,
+                            "MACrossover",
+                            slippage_fraction=slip,
                         )
                     )
-                    fee = self._execution_fee_usd(shares=float(q), price=close_t, side="sell")
+                    fee = self._execution_fee_usd(shares=float(q), price=sell_px_fee, side="sell")
                     if fee > self._eps:
                         orders.append(OrderCost("USD", -abs(fee), "MACrossover", state))
         return orders
@@ -362,6 +425,8 @@ def _run_single_sma_window(
     target_usd_allocation: float,
     fee_model: str,
     initial_value: float,
+    slippage_fraction: float = DEFAULT_SLIPPAGE_FRACTION,
+    stop_loss_fraction: float = 0.10,
 ):
     triggers = [
         MACrossoverEODTrigger(
@@ -370,6 +435,8 @@ def _run_single_sma_window(
             target_usd_allocation=target_usd_allocation,
             sma_window=int(sma_window),
             fee_model=str(fee_model),
+            slippage_fraction=float(slippage_fraction),
+            stop_loss_fraction=float(stop_loss_fraction),
         )
         for symbol in instruments.keys()
     ]
@@ -391,6 +458,8 @@ def run(
     target_usd_allocation: float = 25_000.0,
     fee_model: str = "futu_us_stock",
     initial_value: float = 50_000_000.0,
+    slippage_fraction: float = DEFAULT_SLIPPAGE_FRACTION,
+    stop_loss_fraction: float = 0.10,
 ) -> None:
     sma_windows = sma_windows or [20]
     data_manager, close_by_symbol, instruments = _build_data_manager(db_path)
@@ -411,6 +480,8 @@ def run(
             target_usd_allocation=float(target_usd_allocation),
             fee_model=str(fee_model),
             initial_value=float(initial_value),
+            slippage_fraction=float(slippage_fraction),
+            stop_loss_fraction=float(stop_loss_fraction),
         )
 
         tr, mdd = _nav_total_return_and_max_drawdown(nav)
@@ -464,6 +535,126 @@ def run(
     print("Done (no GsSession).")
 
 
+# customization: Stage 5 — in-sample SMA selection on 2024, OOS 2025, retail defaults
+def run_stage5_retail_robustness(
+    db_path: Path,
+    *,
+    sma_sweep_windows: list[int],
+    target_usd_allocation: float = 25_000.0,
+    fee_model: str = "futu_us_stock",
+    initial_value: float | None = None,
+    slippage_fraction: float = DEFAULT_SLIPPAGE_FRACTION,
+    stop_loss_fraction: float = 0.10,
+) -> None:
+    """
+    Find the best SMA period using **only** 2024, then run that window on 2024 and on **fresh** 2025 data.
+    Prints a Sharpe / total-return comparison table (two notional years, same rules).
+    """
+    iv = float(initial_value) if initial_value is not None else max(100_000.0, 2.2 * float(target_usd_allocation))
+    start_2024, end_2024 = dt.date(2024, 1, 1), dt.date(2024, 12, 31)
+    start_2025, end_2025 = dt.date(2025, 1, 1), dt.date(2025, 12, 31)
+
+    data_manager, close_by_symbol, instruments = _build_data_manager(db_path)
+
+    print("=== Stage 5: SMA sweep on 2024 only (in-sample, rf=0 Sharpe) ===\n")
+    sweep_rows: list[dict] = []
+    for w in sma_sweep_windows:
+        backtest, _summary, nav, sharpe = _run_single_sma_window(
+            start=start_2024,
+            end=end_2024,
+            data_manager=data_manager,
+            close_by_symbol=close_by_symbol,
+            instruments=instruments,
+            sma_window=int(w),
+            target_usd_allocation=float(target_usd_allocation),
+            fee_model=str(fee_model),
+            initial_value=iv,
+            slippage_fraction=float(slippage_fraction),
+            stop_loss_fraction=float(stop_loss_fraction),
+        )
+        tr, mdd = _nav_total_return_and_max_drawdown(nav)
+        sweep_rows.append(
+            {
+                "sma_window": int(w),
+                "annualized_sharpe": sharpe,
+                "total_return_pct": tr,
+                "max_drawdown_pct": abs(mdd),
+                "orders_generated": len(backtest.orders),
+            }
+        )
+        print(f"--- 2024 SMA window = {int(w)} ---")
+        print(f"Annualized Sharpe (rf=0): {sharpe:.4f} | Total Return %: {tr:.4f}% | Max DD %: {abs(mdd):.4f}%")
+
+    sweep_df = pd.DataFrame(sweep_rows).sort_values(
+        ["annualized_sharpe", "total_return_pct"], ascending=[False, False], na_position="last"
+    )
+    print("\n=== 2024 sweep ranking ===")
+    print(sweep_df.reset_index(drop=True).to_string())
+    if sweep_df.empty:
+        raise RuntimeError("No 2024 sweep results.")
+
+    best_w = int(sweep_df.iloc[0]["sma_window"])
+    best_sharpe_2024_sweep = float(sweep_df.iloc[0]["annualized_sharpe"])
+    print(f"\n>>> Best SMA window from 2024 only: {best_w} (Sharpe in sweep: {best_sharpe_2024_sweep:.4f})\n")
+
+    _, _, nav24, sh24 = _run_single_sma_window(
+        start=start_2024,
+        end=end_2024,
+        data_manager=data_manager,
+        close_by_symbol=close_by_symbol,
+        instruments=instruments,
+        sma_window=best_w,
+        target_usd_allocation=float(target_usd_allocation),
+        fee_model=str(fee_model),
+        initial_value=iv,
+        slippage_fraction=float(slippage_fraction),
+        stop_loss_fraction=float(stop_loss_fraction),
+    )
+    _, _, nav25, sh25 = _run_single_sma_window(
+        start=start_2025,
+        end=end_2025,
+        data_manager=data_manager,
+        close_by_symbol=close_by_symbol,
+        instruments=instruments,
+        sma_window=best_w,
+        target_usd_allocation=float(target_usd_allocation),
+        fee_model=str(fee_model),
+        initial_value=iv,
+        slippage_fraction=float(slippage_fraction),
+        stop_loss_fraction=float(stop_loss_fraction),
+    )
+
+    tr24, _ = _nav_total_return_and_max_drawdown(nav24)
+    tr25, _ = _nav_total_return_and_max_drawdown(nav25)
+
+    comparison = pd.DataFrame(
+        [
+            {"Year": "2024", "SMA_window": best_w, "Sharpe_Ratio": sh24, "Total_Return_pct": tr24},
+            {"Year": "2025", "SMA_window": best_w, "Sharpe_Ratio": sh25, "Total_Return_pct": tr25},
+        ]
+    )
+    print("=== Comparison: same rules & capital, window fixed from 2024 ===")
+    print(comparison.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+    print(
+        f"\n(Initial NAV USD {iv:,.0f}; per-symbol target notional USD {target_usd_allocation:,.0f}; "
+        f"slippage {slippage_fraction * 100:.3f}%; hard stop {stop_loss_fraction * 100:.1f}% below entry.)"
+    )
+
+    if len(nav25.dropna()):
+        nav_plot = nav25.dropna().astype(float)
+        plt.figure(figsize=(10, 5))
+        plt.plot(nav_plot.index, nav_plot.values, linewidth=1.5)
+        plt.title(f"2025 OOS equity (SMA={best_w}, Sharpe={sh25:.4f})")
+        plt.xlabel("Date")
+        plt.ylabel("Total NAV")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("backtest_result.png", dpi=150)
+        plt.close()
+
+    print("\nDone (Stage 5, no GsSession).")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Local SQLite PredefinedAssetEngine MA crossover demo")
     parser.add_argument(
@@ -477,19 +668,36 @@ def main() -> None:
         default=_repo_root() / "shared_data" / "market.db",
         help="Path to SQLite file (default: ./shared_data/market.db)",
     )
+    parser.add_argument(
+        "--initial-value",
+        type=float,
+        default=None,
+        help="Starting portfolio NAV in USD (default: max(100k, 2.2× per-symbol target) for Stage 5)",
+    )
     args = parser.parse_args()
     if args.quick:
         start, end = dt.date(2024, 6, 3), dt.date(2024, 6, 7)
-    else:
-        start, end = dt.date(2024, 1, 1), dt.date(2025, 12, 31)
+        try:
+            run(
+                start,
+                end,
+                args.db.resolve(),
+                sma_windows=[20],
+                target_usd_allocation=25_000.0,
+                fee_model="futu_us_stock",
+                initial_value=max(100_000.0, 55_000.0),
+            )
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            raise
+        return
     try:
-        run(
-            start,
-            end,
+        run_stage5_retail_robustness(
             args.db.resolve(),
-            sma_windows=[5, 10, 15, 20, 30, 50],
+            sma_sweep_windows=[5, 10, 15, 20, 30, 50],
             target_usd_allocation=25_000.0,
             fee_model="futu_us_stock",
+            initial_value=args.initial_value,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

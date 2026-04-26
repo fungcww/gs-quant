@@ -1,5 +1,7 @@
 {
   "name": "GS Quant",
+  // customization: Docker --name cannot contain spaces; use slug matching display name
+  "runArgs": ["--name", "gs-quant"],
   "image": "mcr.microsoft.com/devcontainers/python:3.12-bookworm",
   "customizations": {
     "vscode": {
