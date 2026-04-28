@@ -5,13 +5,15 @@ Local backtest using PredefinedAssetEngine + SQLiteDataSource (no GsSession / Ma
 
 - Real daily OHLC history for AAPL and SMR via yfinance, persisted to ``market.db``.
 - MA crossover vs 20-day SMA: enter on bullish cross (price crosses above SMA); exit when close < SMA.
+- ADX(14) trend filter on SQLite H/L/C: new buys only when ADX > 20.
 - Logic gates: buy only when flat; sell full position on exit signal.
 - Per-trade fees via OrderCost (Futu-style US stock estimate) so result_summary shows cumulative transaction costs.
-- Stage 5 (default full run): 0.05% slippage on fills, 10% hard stop vs entry, pick best SMA on 2024 only, then report 2024 vs 2025 with that window.
+- Stage 6 (default full run): 0.05% slippage, Futu fees, 2024 SMA sweep + neighborhood stability, expanded retail metrics,
+  ``stability_heatmap.png`` (2024 Sharpe vs SMA), and 2024/2025 comparison with the in-sample best window.
 
 Run from the repository root::
 
-    python local_backtest_runner.py              # Stage 5 retail robustness + comparison table
+    python local_backtest_runner.py              # Stage 6 retail robustness + comparison table
     python local_backtest_runner.py --quick   # one week smoke test
 """
 
@@ -37,8 +39,10 @@ from gs_quant.instrument import EqStock
 from gs_quant.timeseries.helper import Window
 from gs_quant.timeseries.technicals import moving_average
 
-# customization: research-framework utilities (sweep, sharpe, plots)
+# customization: research-framework utilities (sweep, sharpe, plots, ADX)
 import math
+
+import numpy as np
 
 import matplotlib as mpl
 
@@ -104,6 +108,8 @@ ORDER BY date
 """
 
 
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent
 
@@ -128,13 +134,20 @@ def ensure_market_db(db_path: Path) -> None:
             close = bar.get("Close")
             if close is None or (isinstance(close, float) and pd.isna(close)):
                 continue
+            high = bar.get("High")
+            low = bar.get("Low")
+            if high is None or (isinstance(high, float) and pd.isna(high)):
+                high = close
+            if low is None or (isinstance(low, float) and pd.isna(low)):
+                low = close
             vol = bar.get("Volume", 0)
             if vol is None or (isinstance(vol, float) and pd.isna(vol)):
                 v_int = 0
             else:
                 v_int = int(vol)
             d = pd.Timestamp(ts).date().strftime("%Y-%m-%d")
-            rows.append((d, symbol, float(close), v_int))
+            # customization: persist H/L for ADX(14) from SQLite
+            rows.append((d, symbol, float(high), float(low), float(close), v_int))
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -142,16 +155,25 @@ def ensure_market_db(db_path: Path) -> None:
             CREATE TABLE IF NOT EXISTS market_history (
                 date TEXT,
                 symbol TEXT,
+                high_price REAL,
+                low_price REAL,
                 close_price REAL,
                 volume INTEGER,
                 PRIMARY KEY (date, symbol)
             )
             """
         )
+        # customization: migrate older DBs that only had close + volume
+        cur = conn.execute("PRAGMA table_info(market_history)")
+        col_names = {row[1] for row in cur.fetchall()}
+        if "high_price" not in col_names:
+            conn.execute("ALTER TABLE market_history ADD COLUMN high_price REAL")
+        if "low_price" not in col_names:
+            conn.execute("ALTER TABLE market_history ADD COLUMN low_price REAL")
         conn.executemany(
             """
-            INSERT OR REPLACE INTO market_history (date, symbol, close_price, volume)
-            VALUES (?, ?, ?, ?)
+            INSERT OR REPLACE INTO market_history (date, symbol, high_price, low_price, close_price, volume)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -162,6 +184,8 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
     """
     SMA barrier: buy on bullish crossover (close crosses above SMA) when flat;
     sell entire long when close < SMA. Optional hard stop vs entry (retail).
+    When ``high_series`` and ``low_series`` are supplied (SQLite H/L with close), ADX(14) is computed
+    and **new buys** require ADX > ``adx_buy_min`` (default 20) to reduce entries in non-trending regimes.
     Brokerage-style fees per routed order leg via OrderCost; fills use ``OrderAtMarketWithSlippage``.
     """
 
@@ -177,12 +201,33 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         # customization: retail robustness (slippage + hard stop vs purchase price)
         slippage_fraction: float = DEFAULT_SLIPPAGE_FRACTION,
         stop_loss_fraction: float = 0.10,
+        # customization: ADX(14) from SQLite H/L/C — new longs only when ADX > threshold (trending regime)
+        high_series: pd.Series | None = None,
+        low_series: pd.Series | None = None,
+        adx_period: int = 14,
+        adx_buy_min: float = 20.0,
     ):
         super().__init__()
         s = close_series.copy()
         s.index = pd.to_datetime(s.index).normalize()
         self._instrument = instrument
         self._closes = s.sort_index()
+        # customization: ADX on aligned H/L/C (same calendar as closes)
+        self._adx_buy_min = float(adx_buy_min)
+        self._adx_period = int(adx_period)
+        if high_series is not None and low_series is not None:
+            hi = high_series.copy()
+            lo = low_series.copy()
+            hi.index = pd.to_datetime(hi.index).normalize()
+            lo.index = pd.to_datetime(lo.index).normalize()
+            hi = hi.sort_index().reindex(self._closes.index).astype(float)
+            lo = lo.sort_index().reindex(self._closes.index).astype(float)
+            hi = hi.fillna(self._closes)
+            lo = lo.fillna(self._closes)
+            self._adx = _adx_from_hlc(hi, lo, self._closes, period=self._adx_period)
+        else:
+            # customization: omit gate when H/L not supplied (e.g. legacy smoke tests)
+            self._adx = None
         # customization: use library SMA; Window(w, w-1) keeps ramp aligned with strict w-point average (vs int w alone)
         ramp = max(0, sma_window - 1)
         self._sma = moving_average(self._closes, Window(sma_window, ramp)).reindex(self._closes.index)
@@ -237,6 +282,12 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
             # customization: flat — clear entry reference; only buy on bullish MA cross
             self._purchase_price = None
             if close_prev <= sma_prev and close_t > sma_t:
+                # customization: trend filter — skip new buys unless ADX indicates trending market
+                if self._adx is not None:
+                    adx_raw = self._adx.iloc[i] if i < len(self._adx) else float("nan")
+                    adx_t = float(adx_raw) if not pd.isna(adx_raw) else float("nan")
+                    if not (adx_t == adx_t) or adx_t <= self._adx_buy_min:
+                        return []
                 if close_t <= self._eps or self._target_usd <= self._eps:
                     return []
                 qty = math.floor(self._target_usd / close_t)
@@ -289,6 +340,123 @@ def _load_close_series(db_path: Path, sql: str) -> pd.Series:
         df = pd.read_sql_query(sql, conn)
     idx = pd.to_datetime(df["date"]).dt.normalize()
     return pd.Series(df["close_price"].to_numpy(), index=idx, name="close_price").sort_index()
+
+
+# customization: H/L/C from SQLite for ADX(14); null legacy highs/lows default to close
+def _load_symbol_hlc(db_path: Path, symbol: str) -> tuple[pd.Series, pd.Series, pd.Series]:
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(
+            "SELECT date, high_price, low_price, close_price FROM market_history WHERE symbol = ? ORDER BY date",
+            conn,
+            params=(symbol,),
+        )
+    idx = pd.to_datetime(df["date"]).dt.normalize()
+    close = pd.to_numeric(df["close_price"], errors="coerce")
+    high = pd.to_numeric(df["high_price"], errors="coerce").fillna(close)
+    low = pd.to_numeric(df["low_price"], errors="coerce").fillna(close)
+    hi = pd.Series(high.to_numpy(), index=idx, name="high_price").sort_index()
+    lo = pd.Series(low.to_numpy(), index=idx, name="low_price").sort_index()
+    cl = pd.Series(close.to_numpy(), index=idx, name="close_price").sort_index()
+    return hi, lo, cl
+
+
+# customization: Wilder-style ADX (period 14) from high/low/close
+def _adx_from_hlc(high: pd.Series, low: pd.Series, close: pd.Series, *, period: int = 14) -> pd.Series:
+    h = high.astype(float).sort_index()
+    lo = low.astype(float).sort_index()
+    c = close.astype(float).sort_index()
+    prev_c = c.shift(1)
+    tr = pd.concat([h - lo, (h - prev_c).abs(), (lo - prev_c).abs()], axis=1).max(axis=1)
+    up_move = h.diff()
+    down_move = -lo.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    plus_dm_s = pd.Series(plus_dm, index=c.index)
+    minus_dm_s = pd.Series(minus_dm, index=c.index)
+    alpha = 1.0 / float(period)
+    atr = tr.ewm(alpha=alpha, adjust=False).mean()
+    sm_plus = plus_dm_s.ewm(alpha=alpha, adjust=False).mean()
+    sm_minus = minus_dm_s.ewm(alpha=alpha, adjust=False).mean()
+    atr_safe = atr.replace(0.0, np.nan)
+    plus_di = 100.0 * (sm_plus / atr_safe)
+    minus_di = 100.0 * (sm_minus / atr_safe)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx.reindex(c.index)
+
+
+def _max_drawdown_duration_days(nav: pd.Series) -> int:
+    """Longest streak of consecutive calendar days strictly below the running peak NAV."""
+    nav = nav.astype(float).dropna()
+    if len(nav) < 2:
+        return 0
+    peak = nav.cummax()
+    underwater = (nav < peak).to_numpy()
+    best = cur = 0
+    for u in underwater:
+        if u:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    return int(best)
+
+
+def _recovery_factor(nav: pd.Series) -> float:
+    """Total return (decimal) divided by max drawdown depth (decimal, positive)."""
+    nav = nav.astype(float).dropna()
+    if len(nav) < 2:
+        return float("nan")
+    initial = float(nav.iloc[0])
+    final = float(nav.iloc[-1])
+    if abs(initial) <= 1e-12:
+        return float("nan")
+    total_ret = final / initial - 1.0
+    running_max = nav.cummax()
+    depth = float(1.0 - (nav / running_max).min())
+    if depth <= 1e-12:
+        return float("inf") if total_ret > 0 else float("nan")
+    return float(total_ret / depth)
+
+
+def _profit_factor_from_backtest(backtest) -> float:
+    """Gross wins / gross losses from closed round-trip price PnL in ``trade_ledger`` (fees separate)."""
+    try:
+        ledger = backtest.trade_ledger()
+    except Exception:
+        return float("nan")
+    if ledger is None or ledger.empty or "Trade PnL" not in ledger.columns:
+        return float("nan")
+    pnl = ledger.loc[ledger["Status"] == "closed", "Trade PnL"].dropna().astype(float)
+    if pnl.empty:
+        return float("nan")
+    wins = pnl[pnl > 0].sum()
+    losses = pnl[pnl < 0].sum()
+    if losses == 0:
+        return float("inf") if wins > 0 else float("nan")
+    return float(wins / abs(losses))
+
+
+def _expanded_retail_metrics_lines(backtest, nav: pd.Series) -> list[str]:
+    tr, mdd = _nav_total_return_and_max_drawdown(nav)
+    dd_days = _max_drawdown_duration_days(nav)
+    pf = _profit_factor_from_backtest(backtest)
+    rf = _recovery_factor(nav)
+    if not math.isfinite(pf):
+        pf_s = "inf (no losing closed legs)" if pf == float("inf") else "nan"
+    else:
+        pf_s = f"{pf:.4f}"
+    if not math.isfinite(rf):
+        rf_s = "inf" if rf == float("inf") else "nan"
+    else:
+        rf_s = f"{rf:.4f}"
+    return [
+        f"Max drawdown duration (days underwater): {dd_days}",
+        f"Profit factor (sum wins / |sum losses|, ledger PnL): {pf_s}",
+        f"Recovery factor (total return / max DD depth): {rf_s}",
+        f"Total return % (Total NAV): {tr:.4f}%",
+        f"Maximum drawdown % (Total NAV): {abs(mdd):.4f}%",
+    ]
 
 
 def _nav_total_return_and_max_drawdown(nav: pd.Series) -> tuple[float, float]:
@@ -360,12 +528,16 @@ def _annualized_sharpe_from_nav(nav: pd.Series, annualization_factor: int = 252)
     return float(math.sqrt(annualization_factor) * float(rets.mean()) / vol)
 
 
-def _build_data_manager(db_path: Path) -> tuple[DataManager, dict[str, pd.Series], dict[str, EqStock]]:
+def _build_data_manager(
+    db_path: Path,
+) -> tuple[DataManager, dict[str, pd.Series], dict[str, EqStock], dict[str, tuple[pd.Series, pd.Series, pd.Series]]]:
     ensure_market_db(db_path)
     close_by_symbol = {
         "AAPL": _load_close_series(db_path, AAPL_SQL),
         "SMR": _load_close_series(db_path, SMR_SQL),
     }
+    # customization: aligned H/L/C per symbol for ADX(14) in triggers
+    hlc_by_symbol = {sym: _load_symbol_hlc(db_path, sym) for sym in _TICKERS}
 
     # fill_forward: engine marks to market on calendar days (e.g. holidays) and RT series uses EOD clock, not midnight
     _mds = MissingDataStrategy.fill_forward
@@ -411,7 +583,7 @@ def _build_data_manager(db_path: Path) -> tuple[DataManager, dict[str, pd.Series
     data_manager.add_data_source(smr_daily, DataFrequency.DAILY, instruments["SMR"], ValuationFixingType.PRICE)
     data_manager.add_data_source(smr_rt, DataFrequency.REAL_TIME, instruments["SMR"], ValuationFixingType.PRICE)
 
-    return data_manager, close_by_symbol, instruments
+    return data_manager, close_by_symbol, instruments, hlc_by_symbol
 
 
 def _run_single_sma_window(
@@ -427,19 +599,26 @@ def _run_single_sma_window(
     initial_value: float,
     slippage_fraction: float = DEFAULT_SLIPPAGE_FRACTION,
     stop_loss_fraction: float = 0.10,
+    hlc_by_symbol: dict[str, tuple[pd.Series, pd.Series, pd.Series]] | None = None,
 ):
-    triggers = [
-        MACrossoverEODTrigger(
-            instruments[symbol],
-            close_by_symbol[symbol],
-            target_usd_allocation=target_usd_allocation,
-            sma_window=int(sma_window),
-            fee_model=str(fee_model),
-            slippage_fraction=float(slippage_fraction),
-            stop_loss_fraction=float(stop_loss_fraction),
+    triggers = []
+    for symbol in instruments.keys():
+        hi = lo = None
+        if hlc_by_symbol is not None and symbol in hlc_by_symbol:
+            hi, lo, _cl = hlc_by_symbol[symbol]
+        triggers.append(
+            MACrossoverEODTrigger(
+                instruments[symbol],
+                close_by_symbol[symbol],
+                target_usd_allocation=target_usd_allocation,
+                sma_window=int(sma_window),
+                fee_model=str(fee_model),
+                slippage_fraction=float(slippage_fraction),
+                stop_loss_fraction=float(stop_loss_fraction),
+                high_series=hi,
+                low_series=lo,
+            )
         )
-        for symbol in instruments.keys()
-    ]
     strategy = Strategy(initial_portfolio=None, triggers=triggers)
     engine = PredefinedAssetEngine(data_mgr=data_manager)
     backtest = engine.run_backtest(strategy, start=start, end=end, initial_value=float(initial_value))
@@ -462,7 +641,7 @@ def run(
     stop_loss_fraction: float = 0.10,
 ) -> None:
     sma_windows = sma_windows or [20]
-    data_manager, close_by_symbol, instruments = _build_data_manager(db_path)
+    data_manager, close_by_symbol, instruments, hlc_by_symbol = _build_data_manager(db_path)
 
     rows: list[dict] = []
     best_window: int | None = None
@@ -482,6 +661,7 @@ def run(
             initial_value=float(initial_value),
             slippage_fraction=float(slippage_fraction),
             stop_loss_fraction=float(stop_loss_fraction),
+            hlc_by_symbol=hlc_by_symbol,
         )
 
         tr, mdd = _nav_total_return_and_max_drawdown(nav)
@@ -535,7 +715,31 @@ def run(
     print("Done (no GsSession).")
 
 
-# customization: Stage 5 — in-sample SMA selection on 2024, OOS 2025, retail defaults
+# customization: Stage 6 — ADX gate, neighborhood stability, expanded retail metrics, stability heatmap
+def _save_stability_heatmap(sweep_df: pd.DataFrame, out_path: str = "stability_heatmap.png") -> None:
+    """2024: SMA window (X) vs annualized Sharpe (Y), color-mapped for quick regime read."""
+    df = sweep_df.sort_values("sma_window")
+    if df.empty:
+        return
+    y_raw = df["annualized_sharpe"].astype(float).to_numpy()
+    x_raw = df["sma_window"].astype(int).to_numpy()
+    ok = np.isfinite(y_raw)
+    if not np.any(ok):
+        return
+    x, y = x_raw[ok], y_raw[ok]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    sc = ax.scatter(x, y, c=y, cmap="RdYlGn", s=160, edgecolors="0.35", zorder=3, vmin=float(np.min(y)), vmax=float(np.max(y)))
+    ax.plot(x, y, color="0.45", lw=1.1, alpha=0.9, zorder=2)
+    fig.colorbar(sc, ax=ax, label="Annualized Sharpe (rf=0)")
+    ax.set_xlabel("SMA window")
+    ax.set_ylabel("Annualized Sharpe (rf=0)")
+    ax.set_title("2024 in-sample: Sharpe vs SMA window (stability heatmap)")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+
 def run_stage5_retail_robustness(
     db_path: Path,
     *,
@@ -547,16 +751,16 @@ def run_stage5_retail_robustness(
     stop_loss_fraction: float = 0.10,
 ) -> None:
     """
-    Find the best SMA period using **only** 2024, then run that window on 2024 and on **fresh** 2025 data.
-    Prints a Sharpe / total-return comparison table (two notional years, same rules).
+    Stage 6: Find the best SMA on **2024 only**, neighborhood stability sweep, ADX(14)>20 buy filter,
+    expanded retail metrics, ``stability_heatmap.png``, then same window on 2025 for OOS context.
     """
     iv = float(initial_value) if initial_value is not None else max(100_000.0, 2.2 * float(target_usd_allocation))
     start_2024, end_2024 = dt.date(2024, 1, 1), dt.date(2024, 12, 31)
     start_2025, end_2025 = dt.date(2025, 1, 1), dt.date(2025, 12, 31)
 
-    data_manager, close_by_symbol, instruments = _build_data_manager(db_path)
+    data_manager, close_by_symbol, instruments, hlc_by_symbol = _build_data_manager(db_path)
 
-    print("=== Stage 5: SMA sweep on 2024 only (in-sample, rf=0 Sharpe) ===\n")
+    print("=== Stage 6: SMA sweep on 2024 (in-sample, rf=0 Sharpe; ADX>20 buy filter) ===\n")
     sweep_rows: list[dict] = []
     for w in sma_sweep_windows:
         backtest, _summary, nav, sharpe = _run_single_sma_window(
@@ -571,6 +775,7 @@ def run_stage5_retail_robustness(
             initial_value=iv,
             slippage_fraction=float(slippage_fraction),
             stop_loss_fraction=float(stop_loss_fraction),
+            hlc_by_symbol=hlc_by_symbol,
         )
         tr, mdd = _nav_total_return_and_max_drawdown(nav)
         sweep_rows.append(
@@ -597,7 +802,37 @@ def run_stage5_retail_robustness(
     best_sharpe_2024_sweep = float(sweep_df.iloc[0]["annualized_sharpe"])
     print(f"\n>>> Best SMA window from 2024 only: {best_w} (Sharpe in sweep: {best_sharpe_2024_sweep:.4f})\n")
 
-    _, _, nav24, sh24 = _run_single_sma_window(
+    # customization: neighborhood stability (Best_SMA ± 2, clamped to SMA >= 2)
+    neigh_windows = [max(2, best_w + d) for d in (-2, -1, 0, 1, 2)]
+    neigh_sharpes: list[float] = []
+    print("=== Neighborhood stability (2024 Sharpe, Best_SMA − 2 … Best_SMA + 2) ===\n")
+    for w in neigh_windows:
+        _, _, nav_n, sh_n = _run_single_sma_window(
+            start=start_2024,
+            end=end_2024,
+            data_manager=data_manager,
+            close_by_symbol=close_by_symbol,
+            instruments=instruments,
+            sma_window=int(w),
+            target_usd_allocation=float(target_usd_allocation),
+            fee_model=str(fee_model),
+            initial_value=iv,
+            slippage_fraction=float(slippage_fraction),
+            stop_loss_fraction=float(stop_loss_fraction),
+            hlc_by_symbol=hlc_by_symbol,
+        )
+        sh_f = float(sh_n) if sh_n == sh_n else float("nan")
+        neigh_sharpes.append(sh_f)
+        tr_n, mdd_n = _nav_total_return_and_max_drawdown(nav_n)
+        print(f"  SMA={int(w)}: Sharpe={sh_f:.6f} | Total Return %: {tr_n:.4f}% | Max DD %: {abs(mdd_n):.4f}%")
+
+    stab_arr = np.array(neigh_sharpes, dtype=float)
+    stability_score = float(np.nanstd(stab_arr, ddof=0)) if np.any(np.isfinite(stab_arr)) else float("nan")
+    print(f"\nStability score (std dev of neighborhood Sharpes): {stability_score:.6f}")
+    if stability_score == stability_score and stability_score > 0.3:
+        print("WARNING: High Parameter Sensitivity - Strategy may be overfitted.")
+
+    bt24, _, nav24, sh24 = _run_single_sma_window(
         start=start_2024,
         end=end_2024,
         data_manager=data_manager,
@@ -609,8 +844,9 @@ def run_stage5_retail_robustness(
         initial_value=iv,
         slippage_fraction=float(slippage_fraction),
         stop_loss_fraction=float(stop_loss_fraction),
+        hlc_by_symbol=hlc_by_symbol,
     )
-    _, _, nav25, sh25 = _run_single_sma_window(
+    bt25, _, nav25, sh25 = _run_single_sma_window(
         start=start_2025,
         end=end_2025,
         data_manager=data_manager,
@@ -622,6 +858,7 @@ def run_stage5_retail_robustness(
         initial_value=iv,
         slippage_fraction=float(slippage_fraction),
         stop_loss_fraction=float(stop_loss_fraction),
+        hlc_by_symbol=hlc_by_symbol,
     )
 
     tr24, _ = _nav_total_return_and_max_drawdown(nav24)
@@ -633,12 +870,24 @@ def run_stage5_retail_robustness(
             {"Year": "2025", "SMA_window": best_w, "Sharpe_Ratio": sh25, "Total_Return_pct": tr25},
         ]
     )
-    print("=== Comparison: same rules & capital, window fixed from 2024 ===")
+    print("\n=== Comparison: same rules & capital, window fixed from 2024 ===")
     print(comparison.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
     print(
         f"\n(Initial NAV USD {iv:,.0f}; per-symbol target notional USD {target_usd_allocation:,.0f}; "
-        f"slippage {slippage_fraction * 100:.3f}%; hard stop {stop_loss_fraction * 100:.1f}% below entry.)"
+        f"slippage {slippage_fraction * 100:.3f}%; hard stop {stop_loss_fraction * 100:.1f}% below entry; "
+        f"ADX(14) buy gate > 20.)"
     )
+
+    print("\n=== Expanded retail metrics (best SMA from 2024) ===")
+    print("--- 2024 ---")
+    for line in _expanded_retail_metrics_lines(bt24, nav24):
+        print(line)
+    print("--- 2025 ---")
+    for line in _expanded_retail_metrics_lines(bt25, nav25):
+        print(line)
+
+    _save_stability_heatmap(sweep_df, "stability_heatmap.png")
+    print("\nWrote stability_heatmap.png (2024 Sharpe vs SMA window).")
 
     if len(nav25.dropna()):
         nav_plot = nav25.dropna().astype(float)
@@ -652,7 +901,7 @@ def run_stage5_retail_robustness(
         plt.savefig("backtest_result.png", dpi=150)
         plt.close()
 
-    print("\nDone (Stage 5, no GsSession).")
+    print("\nDone (Stage 6, no GsSession).")
 
 
 def main() -> None:
@@ -672,7 +921,7 @@ def main() -> None:
         "--initial-value",
         type=float,
         default=None,
-        help="Starting portfolio NAV in USD (default: max(100k, 2.2× per-symbol target) for Stage 5)",
+        help="Starting portfolio NAV in USD (default: max(100k, 2.2× per-symbol target) for Stage 6)",
     )
     args = parser.parse_args()
     if args.quick:
