@@ -10,6 +10,8 @@ Local backtest using PredefinedAssetEngine + SQLiteDataSource (no GsSession / Ma
 - Per-trade fees via OrderCost (Futu-style US stock estimate) so result_summary shows cumulative transaction costs.
 - Stage 6 (default full run): 0.05% slippage, Futu fees, 2024 SMA sweep + neighborhood stability, expanded retail metrics,
   ``stability_heatmap.png`` (2024 Sharpe vs SMA), and 2024/2025 comparison with the in-sample best window.
+- Stage 8 (Regime Switching): ADX(14) gear-shifter — Trend mode (ADX>25, SMA crossover) vs Mean Reversion
+  (ADX<20, Bollinger Band lower touch / SMA return exit). ATR sizing + Chandelier stop preserved in both modes.
 
 Run from the repository root::
 
@@ -186,6 +188,9 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
     sell entire long when close < SMA. Optional hard stop vs entry (retail).
     When ``high_series`` and ``low_series`` are supplied (SQLite H/L with close), ADX(14) is computed
     and **new buys** require ADX > ``adx_buy_min`` (default 20) to reduce entries in non-trending regimes.
+    Stage 8 (``use_regime_switching=True``): ADX gear-shifter — ADX>25 uses SMA crossover (Trend mode);
+    ADX<20 uses Bollinger Band lower-touch entry with SMA-return exit (Mean Reversion mode).
+    ATR sizing and Chandelier trailing stop are preserved in both modes.
     Brokerage-style fees per routed order leg via OrderCost; fills use ``OrderAtMarketWithSlippage``.
     """
 
@@ -215,6 +220,10 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         low_series: pd.Series | None = None,
         adx_period: int = 14,
         adx_buy_min: float = 20.0,
+        # Stage 8 regime switching
+        use_regime_switching: bool = False,
+        adx_trend_min: float = 25.0,
+        adx_mean_rev_max: float = 20.0,
     ):
         super().__init__()
         s = close_series.copy()
@@ -240,6 +249,19 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         # customization: use library SMA; Window(w, w-1) keeps ramp aligned with strict w-point average (vs int w alone)
         ramp = max(0, sma_window - 1)
         self._sma = moving_average(self._closes, Window(sma_window, ramp)).reindex(self._closes.index)
+        # Stage 8 regime switching
+        self._use_regime_switching = bool(use_regime_switching)
+        self._adx_trend_min = float(adx_trend_min)
+        self._adx_mean_rev_max = float(adx_mean_rev_max)
+        self._entry_mode: str | None = None
+        self._lower_band: pd.Series | None = None
+        self._upper_band: pd.Series | None = None
+        if self._use_regime_switching:
+            if self._adx is None:
+                raise ValueError("Stage 8 regime switching requires high_series and low_series for ADX.")
+            _std = self._closes.rolling(int(sma_window), min_periods=int(sma_window)).std()
+            self._lower_band = (self._sma - 2.0 * _std).reindex(self._closes.index)
+            self._upper_band = (self._sma + 2.0 * _std).reindex(self._closes.index)
         # customization: equal-dollar sizing per entry (shares derived from signal-day close)
         self._target_usd = float(target_usd_allocation)
         self._fee_model = str(fee_model)
@@ -321,60 +343,91 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         buy_px_fee = close_t * (1.0 + slip)
         sell_px_fee = close_t * (1.0 - slip)
 
+        # resolve ADX once per bar (used by both regime modes and legacy gate)
+        adx_t: float = float("nan")
+        if self._adx is not None:
+            adx_raw = self._adx.iloc[i] if i < len(self._adx) else float("nan")
+            adx_t = float(adx_raw) if not pd.isna(adx_raw) else float("nan")
+
         if pos <= self._eps:
-            # customization: flat — clear entry reference; only buy on bullish MA cross
             self._purchase_price = None
             self._highest_close_since_entry = None
-            if close_prev <= sma_prev and close_t > sma_t:
-                # customization: trend filter — skip new buys unless ADX indicates trending market
-                if self._adx is not None:
-                    adx_raw = self._adx.iloc[i] if i < len(self._adx) else float("nan")
-                    adx_t = float(adx_raw) if not pd.isna(adx_raw) else float("nan")
-                    if not (adx_t == adx_t) or adx_t <= self._adx_buy_min:
-                        return []
-                if close_t <= self._eps:
+            self._entry_mode = None
+
+            buy_signal = False
+            new_entry_mode: str | None = None
+
+            if self._use_regime_switching:
+                if math.isfinite(adx_t):
+                    if adx_t > self._adx_trend_min:
+                        # Mode A (Trend): SMA crossover entry
+                        if close_prev <= sma_prev and close_t > sma_t:
+                            buy_signal = True
+                            new_entry_mode = "trend"
+                    elif adx_t < self._adx_mean_rev_max:
+                        # Mode B (Mean Reversion): price touches or drops below Lower Bollinger Band
+                        if self._lower_band is not None:
+                            lb_raw = self._lower_band.iloc[i] if i < len(self._lower_band) else float("nan")
+                            lb_t = float(lb_raw) if not pd.isna(lb_raw) else float("nan")
+                            if math.isfinite(lb_t) and close_t <= lb_t:
+                                buy_signal = True
+                                new_entry_mode = "mean_rev"
+                    # ADX in dead zone [adx_mean_rev_max, adx_trend_min]: no new entries
+            else:
+                # original logic: SMA crossover + ADX > adx_buy_min gate
+                if close_prev <= sma_prev and close_t > sma_t:
+                    if self._adx is not None:
+                        if not (adx_t == adx_t) or adx_t <= self._adx_buy_min:
+                            return []
+                    buy_signal = True
+
+            if not buy_signal:
+                return []
+            if close_t <= self._eps:
+                return []
+
+            # position sizing: ATR inverse-vol (Stage 7+) or fixed dollar (Stage 6)
+            if self._use_atr_position_sizing:
+                if self._atr is None:
                     return []
-                # customization: Stage 7 — inverse-vol sizing via ATR(20) risk unit
-                if self._use_atr_position_sizing:
-                    if self._atr is None:
-                        return []
-                    atr_raw = self._atr.iloc[i] if i < len(self._atr) else float("nan")
-                    atr_t = float(atr_raw) if not pd.isna(atr_raw) else float("nan")
-                    if not math.isfinite(atr_t) or atr_t <= self._eps:
-                        return []
-                    nav = self._latest_nav_usd(backtest)
-                    if not math.isfinite(nav) or nav <= self._eps:
-                        return []
-                    risk_usd = nav * self._atr_risk_fraction
-                    shares_float = risk_usd / atr_t
-                    qty = int(math.floor(shares_float))
-                    # cap max allocation to avoid over-sizing in low-volatility periods
-                    max_shares = int(math.floor((nav * self._atr_max_alloc_fraction) / close_t))
-                    qty = int(min(qty, max_shares))
-                else:
-                    if self._target_usd <= self._eps:
-                        return []
-                    qty = int(math.floor(self._target_usd / close_t))
-                if qty <= 0:
+                atr_raw = self._atr.iloc[i] if i < len(self._atr) else float("nan")
+                atr_t = float(atr_raw) if not pd.isna(atr_raw) else float("nan")
+                if not math.isfinite(atr_t) or atr_t <= self._eps:
                     return []
-                # customization: stop anchor = effective buy (mid + half-spread proxy)
-                self._purchase_price = buy_px_fee
-                self._highest_close_since_entry = close_t
-                orders.append(
-                    OrderAtMarketWithSlippage(
-                        self._instrument,
-                        float(qty),
-                        state,
-                        state,
-                        "MACrossover",
-                        slippage_fraction=slip,
-                    )
+                nav = self._latest_nav_usd(backtest)
+                if not math.isfinite(nav) or nav <= self._eps:
+                    return []
+                risk_usd = nav * self._atr_risk_fraction
+                shares_float = risk_usd / atr_t
+                qty = int(math.floor(shares_float))
+                # cap max allocation to avoid over-sizing in low-volatility periods
+                max_shares = int(math.floor((nav * self._atr_max_alloc_fraction) / close_t))
+                qty = int(min(qty, max_shares))
+            else:
+                if self._target_usd <= self._eps:
+                    return []
+                qty = int(math.floor(self._target_usd / close_t))
+            if qty <= 0:
+                return []
+
+            self._purchase_price = buy_px_fee
+            self._highest_close_since_entry = close_t
+            self._entry_mode = new_entry_mode
+            orders.append(
+                OrderAtMarketWithSlippage(
+                    self._instrument,
+                    float(qty),
+                    state,
+                    state,
+                    "MACrossover",
+                    slippage_fraction=slip,
                 )
-                fee = self._execution_fee_usd(shares=float(qty), price=buy_px_fee, side="buy")
-                if fee > self._eps:
-                    orders.append(OrderCost("USD", -abs(fee), "MACrossover", state))
+            )
+            fee = self._execution_fee_usd(shares=float(qty), price=buy_px_fee, side="buy")
+            if fee > self._eps:
+                orders.append(OrderCost("USD", -abs(fee), "MACrossover", state))
         else:
-            # customization: Stage 7 — Chandelier trailing stop: HighestCloseSinceEntry - (3 * ATR)
+            # Chandelier trailing stop (Stage 7+): HighestCloseSinceEntry - chandelier_mult * ATR
             chandelier_hit = False
             if self._use_atr_position_sizing:
                 if self._highest_close_since_entry is None:
@@ -389,18 +442,25 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
                         if close_t <= stop_level:
                             chandelier_hit = True
 
-            # customization: Stage 6 hard stop below purchase (evaluated on mid close)
+            # Stage 6 hard stop below purchase price (only when not using ATR sizing)
             stop_hit = (
                 (not self._use_atr_position_sizing)
                 and self._purchase_price is not None
                 and close_t <= self._purchase_price * (1.0 - self._stop_loss_fraction)
             )
-            trend_exit = close_t < sma_t
+
+            # regime-aware exit: mean reversion exits when price returns to SMA; trend exits below SMA
+            if self._use_regime_switching and self._entry_mode == "mean_rev":
+                trend_exit = close_t >= sma_t
+            else:
+                trend_exit = close_t < sma_t
+
             if chandelier_hit or stop_hit or trend_exit:
                 q = -pos
                 if abs(q) > self._eps:
                     self._purchase_price = None
                     self._highest_close_since_entry = None
+                    self._entry_mode = None
                     orders.append(
                         OrderAtMarketWithSlippage(
                             self._instrument,
@@ -694,6 +754,7 @@ def _run_single_sma_window(
     stop_loss_fraction: float = 0.10,
     # customization: Stage 7 — ATR sizing + Chandelier stop
     use_atr_position_sizing: bool = False,
+    use_regime_switching: bool = False,
     hlc_by_symbol: dict[str, tuple[pd.Series, pd.Series, pd.Series]] | None = None,
 ):
     triggers = []
@@ -711,6 +772,7 @@ def _run_single_sma_window(
                 slippage_fraction=float(slippage_fraction),
                 stop_loss_fraction=float(stop_loss_fraction),
                 use_atr_position_sizing=bool(use_atr_position_sizing),
+                use_regime_switching=bool(use_regime_switching),
                 high_series=hi,
                 low_series=lo,
             )
@@ -982,11 +1044,11 @@ def run_stage5_retail_robustness(
     for line in _expanded_retail_metrics_lines(bt25, nav25):
         print(line)
 
-    # customization: Stage 7 delta report — compare Stage 6 vs Stage 7 on 2025 OOS chop (MDD + Profit Factor)
-    print("\n=== Stage 6 vs Stage 7 (2025 OOS) — Volatility-Adjusted Risk Management Delta ===")
+    # Stage 6 vs Stage 7 vs Stage 8 (2025 OOS) comparison
+    print("\n=== Stage 6 vs Stage 7 vs Stage 8 (2025 OOS) — Regime-Switching Delta ===")
     bt25_s6 = bt25
     nav25_s6 = nav25
-    # rerun 2025 with Stage 7 (ATR sizing + Chandelier stop); keep ADX>20 gate and same slippage/fees
+    # Stage 7: ATR sizing + Chandelier stop; ADX>20 gate
     bt25_s7, _s7_summary, nav25_s7, _s7_sh = _run_single_sma_window(
         start=start_2025,
         end=end_2025,
@@ -998,28 +1060,44 @@ def run_stage5_retail_robustness(
         fee_model=str(fee_model),
         initial_value=iv,
         slippage_fraction=float(slippage_fraction),
-        stop_loss_fraction=float(stop_loss_fraction),  # unused in Stage 7 mode
+        stop_loss_fraction=float(stop_loss_fraction),
         use_atr_position_sizing=True,
+        hlc_by_symbol=hlc_by_symbol,
+    )
+    # Stage 8: ADX gear-shifter — trend SMA crossover (ADX>25) vs mean-reversion Bollinger (ADX<20)
+    bt25_s8, _s8_summary, nav25_s8, _s8_sh = _run_single_sma_window(
+        start=start_2025,
+        end=end_2025,
+        data_manager=data_manager,
+        close_by_symbol=close_by_symbol,
+        instruments=instruments,
+        sma_window=best_w,
+        target_usd_allocation=float(target_usd_allocation),
+        fee_model=str(fee_model),
+        initial_value=iv,
+        slippage_fraction=float(slippage_fraction),
+        stop_loss_fraction=float(stop_loss_fraction),
+        use_atr_position_sizing=True,
+        use_regime_switching=True,
         hlc_by_symbol=hlc_by_symbol,
     )
     _tr_s6, mdd_s6 = _nav_total_return_and_max_drawdown(nav25_s6)
     _tr_s7, mdd_s7 = _nav_total_return_and_max_drawdown(nav25_s7)
+    _tr_s8, mdd_s8 = _nav_total_return_and_max_drawdown(nav25_s8)
     pf_s6 = _profit_factor_from_backtest(bt25_s6)
     pf_s7 = _profit_factor_from_backtest(bt25_s7)
+    pf_s8 = _profit_factor_from_backtest(bt25_s8)
     report = pd.DataFrame(
         [
-            {"Stage": "6", "Year": "2025", "Max_Drawdown_pct": abs(float(mdd_s6)), "Profit_Factor": float(pf_s6)},
-            {"Stage": "7", "Year": "2025", "Max_Drawdown_pct": abs(float(mdd_s7)), "Profit_Factor": float(pf_s7)},
+            {"Stage": "6 (Fixed)", "Year": "2025", "Max_Drawdown_pct": abs(float(mdd_s6)), "Profit_Factor": float(pf_s6)},
+            {"Stage": "7 (ATR Defensive)", "Year": "2025", "Max_Drawdown_pct": abs(float(mdd_s7)), "Profit_Factor": float(pf_s7)},
+            {"Stage": "8 (Regime Switching)", "Year": "2025", "Max_Drawdown_pct": abs(float(mdd_s8)), "Profit_Factor": float(pf_s8)},
         ]
     )
     print(report.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
-    try:
-        print(
-            f"\nDelta (Stage7 - Stage6): Max_Drawdown_pct={abs(float(mdd_s7)) - abs(float(mdd_s6)):+.6f} | "
-            f"Profit_Factor={float(pf_s7) - float(pf_s6):+.6f}"
-        )
-    except Exception:
-        pass
+    pf_s8_val = float(pf_s8)
+    pf_target_met = math.isfinite(pf_s8_val) and pf_s8_val > 1.0
+    print(f"\nStage 8 Profit Factor > 1.0: {'YES' if pf_target_met else 'NO'} (value: {pf_s8_val:.6f})")
 
     _save_stability_heatmap(sweep_df, "stability_heatmap.png")
     print("\nWrote stability_heatmap.png (2024 Sharpe vs SMA window).")
