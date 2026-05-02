@@ -12,10 +12,14 @@ Local backtest using PredefinedAssetEngine + SQLiteDataSource (no GsSession / Ma
   ``stability_heatmap.png`` (2024 Sharpe vs SMA), and 2024/2025 comparison with the in-sample best window.
 - Stage 8 (Regime Switching): ADX(14) gear-shifter — Trend mode (ADX>25, SMA crossover) vs Mean Reversion
   (ADX<20, Bollinger Band lower touch / SMA return exit). ATR sizing + Chandelier stop preserved in both modes.
+- Stage 9 (Asymmetric Mean Reversion): Tightens the Mean Reversion entry to require RSI(14)<30 in addition to
+  the Lower Bollinger Band touch (exhaustion confirmation). Exits at the Upper Bollinger Band instead of the SMA
+  for an asymmetric risk/reward profile. Includes a hysteresis sweep over ADX Trend Threshold (25/30/35) and
+  reports the 2025 OOS Win/Loss Ratio to validate the asymmetric payout improvement.
 
 Run from the repository root::
 
-    python local_backtest_runner.py              # Stage 6 retail robustness + comparison table
+    python local_backtest_runner.py              # Stage 9 full run (retail robustness + regime comparison)
     python local_backtest_runner.py --quick   # one week smoke test
 """
 
@@ -188,8 +192,10 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
     sell entire long when close < SMA. Optional hard stop vs entry (retail).
     When ``high_series`` and ``low_series`` are supplied (SQLite H/L with close), ADX(14) is computed
     and **new buys** require ADX > ``adx_buy_min`` (default 20) to reduce entries in non-trending regimes.
-    Stage 8 (``use_regime_switching=True``): ADX gear-shifter — ADX>25 uses SMA crossover (Trend mode);
-    ADX<20 uses Bollinger Band lower-touch entry with SMA-return exit (Mean Reversion mode).
+    Stage 9 (``use_regime_switching=True``): ADX gear-shifter — ADX>adx_trend_min uses SMA crossover (Trend
+    mode); ADX<adx_mean_rev_max uses Lower Bollinger Band touch **and** RSI(14)<30 as a dual-confirmation
+    entry (Asymmetric Mean Reversion mode). Exit for mean-reversion positions is the Upper Bollinger Band
+    rather than the SMA, creating an asymmetric risk/reward target.
     ATR sizing and Chandelier trailing stop are preserved in both modes.
     Brokerage-style fees per routed order leg via OrderCost; fills use ``OrderAtMarketWithSlippage``.
     """
@@ -220,10 +226,12 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         low_series: pd.Series | None = None,
         adx_period: int = 14,
         adx_buy_min: float = 20.0,
-        # Stage 8 regime switching
+        # Stage 8/9 regime switching
         use_regime_switching: bool = False,
         adx_trend_min: float = 25.0,
         adx_mean_rev_max: float = 20.0,
+        # Stage 9: RSI(14) exhaustion filter for mean-reversion entries
+        rsi_period: int = 14,
     ):
         super().__init__()
         s = close_series.copy()
@@ -256,12 +264,15 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         self._entry_mode: str | None = None
         self._lower_band: pd.Series | None = None
         self._upper_band: pd.Series | None = None
+        self._rsi: pd.Series | None = None
         if self._use_regime_switching:
             if self._adx is None:
-                raise ValueError("Stage 8 regime switching requires high_series and low_series for ADX.")
+                raise ValueError("Stage 9 regime switching requires high_series and low_series for ADX.")
             _std = self._closes.rolling(int(sma_window), min_periods=int(sma_window)).std()
             self._lower_band = (self._sma - 2.0 * _std).reindex(self._closes.index)
             self._upper_band = (self._sma + 2.0 * _std).reindex(self._closes.index)
+            # Stage 9: RSI(14) exhaustion confirmation for mean-reversion entries
+            self._rsi = _rsi_from_close(self._closes, period=rsi_period)
         # customization: equal-dollar sizing per entry (shares derived from signal-day close)
         self._target_usd = float(target_usd_allocation)
         self._fee_model = str(fee_model)
@@ -365,11 +376,15 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
                             buy_signal = True
                             new_entry_mode = "trend"
                     elif adx_t < self._adx_mean_rev_max:
-                        # Mode B (Mean Reversion): price touches or drops below Lower Bollinger Band
+                        # Mode B (Asymmetric Mean Reversion): Lower Band touch AND RSI(14)<30
                         if self._lower_band is not None:
                             lb_raw = self._lower_band.iloc[i] if i < len(self._lower_band) else float("nan")
                             lb_t = float(lb_raw) if not pd.isna(lb_raw) else float("nan")
-                            if math.isfinite(lb_t) and close_t <= lb_t:
+                            rsi_t = float("nan")
+                            if self._rsi is not None:
+                                rsi_raw = self._rsi.iloc[i] if i < len(self._rsi) else float("nan")
+                                rsi_t = float(rsi_raw) if not pd.isna(rsi_raw) else float("nan")
+                            if math.isfinite(lb_t) and close_t <= lb_t and math.isfinite(rsi_t) and rsi_t < 30.0:
                                 buy_signal = True
                                 new_entry_mode = "mean_rev"
                     # ADX in dead zone [adx_mean_rev_max, adx_trend_min]: no new entries
@@ -449,9 +464,14 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
                 and close_t <= self._purchase_price * (1.0 - self._stop_loss_fraction)
             )
 
-            # regime-aware exit: mean reversion exits when price returns to SMA; trend exits below SMA
+            # regime-aware exit: mean reversion exits at Upper Bollinger Band (asymmetric target); trend exits below SMA
             if self._use_regime_switching and self._entry_mode == "mean_rev":
-                trend_exit = close_t >= sma_t
+                if self._upper_band is not None:
+                    ub_raw = self._upper_band.iloc[i] if i < len(self._upper_band) else float("nan")
+                    ub_t = float(ub_raw) if not pd.isna(ub_raw) else float("nan")
+                    trend_exit = math.isfinite(ub_t) and close_t >= ub_t
+                else:
+                    trend_exit = close_t >= sma_t
             else:
                 trend_exit = close_t < sma_t
 
@@ -527,6 +547,20 @@ def _adx_from_hlc(high: pd.Series, low: pd.Series, close: pd.Series, *, period: 
     return adx.reindex(c.index)
 
 
+# Stage 9: Wilder-style RSI from close prices — used as exhaustion filter on mean-reversion entries
+def _rsi_from_close(close: pd.Series, *, period: int = 14) -> pd.Series:
+    c = close.astype(float).sort_index()
+    delta = c.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    alpha = 1.0 / float(period)
+    avg_gain = gain.ewm(alpha=alpha, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=alpha, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.reindex(c.index)
+
+
 # customization: Stage 7 — ATR (simple moving average of True Range) for inverse-vol sizing & Chandelier stops
 def _atr_from_hlc(high: pd.Series, low: pd.Series, close: pd.Series, *, period: int = 20) -> pd.Series:
     h = high.astype(float).sort_index()
@@ -588,6 +622,26 @@ def _profit_factor_from_backtest(backtest) -> float:
     if losses == 0:
         return float("inf") if wins > 0 else float("nan")
     return float(wins / abs(losses))
+
+
+def _win_loss_ratio_from_backtest(backtest) -> float:
+    """Average winning trade / average losing trade (absolute value) from closed round-trips."""
+    try:
+        ledger = backtest.trade_ledger()
+    except Exception:
+        return float("nan")
+    if ledger is None or ledger.empty or "Trade PnL" not in ledger.columns:
+        return float("nan")
+    pnl = ledger.loc[ledger["Status"] == "closed", "Trade PnL"].dropna().astype(float)
+    if pnl.empty:
+        return float("nan")
+    wins = pnl[pnl > 0]
+    losses = pnl[pnl < 0]
+    if losses.empty:
+        return float("inf") if not wins.empty else float("nan")
+    if wins.empty:
+        return 0.0
+    return float(wins.mean() / abs(losses.mean()))
 
 
 def _expanded_retail_metrics_lines(backtest, nav: pd.Series) -> list[str]:
@@ -755,6 +809,7 @@ def _run_single_sma_window(
     # customization: Stage 7 — ATR sizing + Chandelier stop
     use_atr_position_sizing: bool = False,
     use_regime_switching: bool = False,
+    adx_trend_min: float = 25.0,
     hlc_by_symbol: dict[str, tuple[pd.Series, pd.Series, pd.Series]] | None = None,
 ):
     triggers = []
@@ -773,6 +828,7 @@ def _run_single_sma_window(
                 stop_loss_fraction=float(stop_loss_fraction),
                 use_atr_position_sizing=bool(use_atr_position_sizing),
                 use_regime_switching=bool(use_regime_switching),
+                adx_trend_min=float(adx_trend_min),
                 high_series=hi,
                 low_series=lo,
             )
@@ -1099,6 +1155,47 @@ def run_stage5_retail_robustness(
     pf_target_met = math.isfinite(pf_s8_val) and pf_s8_val > 1.0
     print(f"\nStage 8 Profit Factor > 1.0: {'YES' if pf_target_met else 'NO'} (value: {pf_s8_val:.6f})")
 
+    # Stage 9: 2025 OOS Win/Loss Ratio for baseline Stage 8 run (ADX threshold=25)
+    wl_s8 = _win_loss_ratio_from_backtest(bt25_s8)
+    wl_s8_s = f"{wl_s8:.4f}" if math.isfinite(wl_s8) else ("inf (no losing trades)" if wl_s8 == float("inf") else "N/A")
+    print(f"Stage 8 2025 OOS Win/Loss Ratio (avg win / avg loss): {wl_s8_s}")
+
+    # Stage 9: Hysteresis sweep — ADX Trend Threshold across 25, 30, 35 (2025 OOS)
+    print("\n=== Stage 9: ADX Trend Threshold Hysteresis Sweep (2025 OOS) ===")
+    sweep9_rows: list[dict] = []
+    for adx_thresh in [25, 30, 35]:
+        bt9, _, nav9, sh9 = _run_single_sma_window(
+            start=start_2025,
+            end=end_2025,
+            data_manager=data_manager,
+            close_by_symbol=close_by_symbol,
+            instruments=instruments,
+            sma_window=best_w,
+            target_usd_allocation=float(target_usd_allocation),
+            fee_model=str(fee_model),
+            initial_value=iv,
+            slippage_fraction=float(slippage_fraction),
+            stop_loss_fraction=float(stop_loss_fraction),
+            use_atr_position_sizing=True,
+            use_regime_switching=True,
+            adx_trend_min=float(adx_thresh),
+            hlc_by_symbol=hlc_by_symbol,
+        )
+        tr9, mdd9 = _nav_total_return_and_max_drawdown(nav9)
+        pf9 = _profit_factor_from_backtest(bt9)
+        wl9 = _win_loss_ratio_from_backtest(bt9)
+        sweep9_rows.append({
+            "ADX_Trend_Threshold": adx_thresh,
+            "Sharpe": sh9,
+            "Total_Return_pct": tr9,
+            "Max_Drawdown_pct": abs(float(mdd9)),
+            "Profit_Factor": pf9,
+            "Win_Loss_Ratio": wl9,
+        })
+    sweep9_df = pd.DataFrame(sweep9_rows)
+    print(sweep9_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    print("(Win/Loss Ratio = avg winning trade / avg losing trade; higher is better for asymmetric exits)")
+
     _save_stability_heatmap(sweep_df, "stability_heatmap.png")
     print("\nWrote stability_heatmap.png (2024 Sharpe vs SMA window).")
 
@@ -1114,7 +1211,7 @@ def run_stage5_retail_robustness(
         plt.savefig("backtest_result.png", dpi=150)
         plt.close()
 
-    print("\nDone (Stage 6, no GsSession).")
+    print("\nDone (Stage 9, no GsSession).")
 
 
 def main() -> None:
