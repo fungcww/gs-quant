@@ -16,6 +16,10 @@ Local backtest using PredefinedAssetEngine + SQLiteDataSource (no GsSession / Ma
   the Lower Bollinger Band touch (exhaustion confirmation). Exits at the Upper Bollinger Band instead of the SMA
   for an asymmetric risk/reward profile. Includes a hysteresis sweep over ADX Trend Threshold (25/30/35) and
   reports the 2025 OOS Win/Loss Ratio to validate the asymmetric payout improvement.
+- Stage 10 / M2.1 (Next-Day Open Execution): Removes look-ahead bias by shifting all order fills from
+  signal-day Close to the Open of Day T+1. ``open_price`` is persisted in ``market.db`` via yfinance.
+  A comparison table (M1.9 Close vs M2.1 Open) is printed for 2025 OOS Sharpe, Total Return, and Profit
+  Factor. Litmus test: Profit Factor >= 0.90 confirms the strategy is not scalping unreachable overnight gaps.
 
 Run from the repository root::
 
@@ -57,6 +61,9 @@ import matplotlib.pyplot as plt
 
 # PredefinedAssetEngine uses this wall-clock time for market/valuation events by default.
 _EOD = dt.time(23, 0, 0)
+# M2.1: next-day open execution time (signals fire at EOD, fills execute at T+1 open)
+_MARKET_OPEN = dt.time(9, 30, 0)
+
 
 _TICKERS = ("AAPL", "SMR")
 _DATA_START = "2024-01-01"
@@ -79,23 +86,29 @@ class OrderAtMarketWithSlippage(OrderAtMarket):
         source: str,
         *,
         slippage_fraction: float = DEFAULT_SLIPPAGE_FRACTION,
+        override_fill_price: float | None = None,
     ):
         super().__init__(instrument, quantity, generation_time, execution_datetime, source)
         self._slippage_fraction = float(slippage_fraction)
+        # M2.1: pre-computed fill price (slippage already included) bypasses data_handler lookup
+        self._override_fill_price = float(override_fill_price) if override_fill_price is not None else None
 
     def _execution_price(self, data_handler: DataHandler) -> float:
         if self.executed_price is None:
-            raw = data_handler.get_data(
-                self.execution_datetime, self.instrument, ValuationFixingType.PRICE
-            )
-            q = float(self.quantity)
-            slip = self._slippage_fraction
-            if q > 1e-12:
-                self.executed_price = float(raw * (1.0 + slip))
-            elif q < -1e-12:
-                self.executed_price = float(raw * (1.0 - slip))
+            if self._override_fill_price is not None:
+                self.executed_price = self._override_fill_price
             else:
-                self.executed_price = float(raw)
+                raw = data_handler.get_data(
+                    self.execution_datetime, self.instrument, ValuationFixingType.PRICE
+                )
+                q = float(self.quantity)
+                slip = self._slippage_fraction
+                if q > 1e-12:
+                    self.executed_price = float(raw * (1.0 + slip))
+                elif q < -1e-12:
+                    self.executed_price = float(raw * (1.0 - slip))
+                else:
+                    self.executed_price = float(raw)
         return self.executed_price
 
 
@@ -120,6 +133,10 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+# All generated charts are written here (created on first run if absent)
+_CHARTS_DIR = _repo_root() / "charts"
+
+
 def ensure_market_db(db_path: Path) -> None:
     """Create ``market_history`` if needed and load AAPL/SMR daily closes from yfinance into ``market.db``."""
     try:
@@ -130,7 +147,7 @@ def ensure_market_db(db_path: Path) -> None:
         ) from e
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    rows: list[tuple[str, str, float, int]] = []
+    rows: list[tuple[str, str, float, float, float, float, int]] = []
 
     for symbol in _TICKERS:
         hist = yf.Ticker(symbol).history(start=_DATA_START, end=_DATA_END_EXCLUSIVE, auto_adjust=False)
@@ -140,6 +157,9 @@ def ensure_market_db(db_path: Path) -> None:
             close = bar.get("Close")
             if close is None or (isinstance(close, float) and pd.isna(close)):
                 continue
+            open_px = bar.get("Open")
+            if open_px is None or (isinstance(open_px, float) and pd.isna(open_px)):
+                open_px = close
             high = bar.get("High")
             low = bar.get("Low")
             if high is None or (isinstance(high, float) and pd.isna(high)):
@@ -152,8 +172,8 @@ def ensure_market_db(db_path: Path) -> None:
             else:
                 v_int = int(vol)
             d = pd.Timestamp(ts).date().strftime("%Y-%m-%d")
-            # customization: persist H/L for ADX(14) from SQLite
-            rows.append((d, symbol, float(high), float(low), float(close), v_int))
+            # customization: persist O/H/L for M2.1 next-day open execution and ADX(14)
+            rows.append((d, symbol, float(open_px), float(high), float(low), float(close), v_int))
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -161,6 +181,7 @@ def ensure_market_db(db_path: Path) -> None:
             CREATE TABLE IF NOT EXISTS market_history (
                 date TEXT,
                 symbol TEXT,
+                open_price REAL,
                 high_price REAL,
                 low_price REAL,
                 close_price REAL,
@@ -176,10 +197,12 @@ def ensure_market_db(db_path: Path) -> None:
             conn.execute("ALTER TABLE market_history ADD COLUMN high_price REAL")
         if "low_price" not in col_names:
             conn.execute("ALTER TABLE market_history ADD COLUMN low_price REAL")
+        if "open_price" not in col_names:
+            conn.execute("ALTER TABLE market_history ADD COLUMN open_price REAL")
         conn.executemany(
             """
-            INSERT OR REPLACE INTO market_history (date, symbol, high_price, low_price, close_price, volume)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO market_history (date, symbol, open_price, high_price, low_price, close_price, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -232,6 +255,9 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         adx_mean_rev_max: float = 20.0,
         # Stage 9: RSI(14) exhaustion filter for mean-reversion entries
         rsi_period: int = 14,
+        # M2.1: execute fills at next-day open instead of signal-day close
+        use_next_day_open: bool = False,
+        open_series: pd.Series | None = None,
     ):
         super().__init__()
         s = close_series.copy()
@@ -301,6 +327,15 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
             hi = hi.sort_index().reindex(self._closes.index).astype(float).fillna(self._closes)
             lo = lo.sort_index().reindex(self._closes.index).astype(float).fillna(self._closes)
             self._atr = _atr_from_hlc(hi, lo, self._closes, period=self._atr_period)
+        # M2.1: build next-day open series (index T holds T+1's open price via shift(-1))
+        self._use_next_day_open = bool(use_next_day_open)
+        self._next_open: pd.Series | None = None
+        if self._use_next_day_open and open_series is not None:
+            op = open_series.copy()
+            op.index = pd.to_datetime(op.index).normalize()
+            op = op.sort_index().reindex(self._closes.index).astype(float)
+            self._next_open = op.shift(-1)
+
         if self._fee_model not in {"futu_us_stock", "none"}:
             raise ValueError(f"Unsupported fee_model={self._fee_model!r}; expected 'futu_us_stock' or 'none'.")
 
@@ -351,8 +386,19 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         orders: list = []
 
         slip = self._slippage_fraction
-        buy_px_fee = close_t * (1.0 + slip)
-        sell_px_fee = close_t * (1.0 - slip)
+
+        # M2.1: fill at next-day open when available; fall back to close_t for last bar or missing data
+        _fill_ref = close_t
+        if self._use_next_day_open and self._next_open is not None and i < len(self._next_open):
+            _raw_open = self._next_open.iloc[i]
+            if not pd.isna(_raw_open) and float(_raw_open) > self._eps:
+                _fill_ref = float(_raw_open)
+
+        buy_px_fee = _fill_ref * (1.0 + slip)
+        sell_px_fee = _fill_ref * (1.0 - slip)
+        # pass pre-computed fill price to orders when using next-day open (bypasses data_handler lookup)
+        _override_buy = buy_px_fee if self._use_next_day_open else None
+        _override_sell = sell_px_fee if self._use_next_day_open else None
 
         # resolve ADX once per bar (used by both regime modes and legacy gate)
         adx_t: float = float("nan")
@@ -416,12 +462,12 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
                 shares_float = risk_usd / atr_t
                 qty = int(math.floor(shares_float))
                 # cap max allocation to avoid over-sizing in low-volatility periods
-                max_shares = int(math.floor((nav * self._atr_max_alloc_fraction) / close_t))
+                max_shares = int(math.floor((nav * self._atr_max_alloc_fraction) / _fill_ref))
                 qty = int(min(qty, max_shares))
             else:
                 if self._target_usd <= self._eps:
                     return []
-                qty = int(math.floor(self._target_usd / close_t))
+                qty = int(math.floor(self._target_usd / _fill_ref))
             if qty <= 0:
                 return []
 
@@ -436,6 +482,7 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
                     state,
                     "MACrossover",
                     slippage_fraction=slip,
+                    override_fill_price=_override_buy,
                 )
             )
             fee = self._execution_fee_usd(shares=float(qty), price=buy_px_fee, side="buy")
@@ -489,6 +536,7 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
                             state,
                             "MACrossover",
                             slippage_fraction=slip,
+                            override_fill_price=_override_sell,
                         )
                     )
                     fee = self._execution_fee_usd(shares=float(q), price=sell_px_fee, side="sell")
@@ -504,11 +552,11 @@ def _load_close_series(db_path: Path, sql: str) -> pd.Series:
     return pd.Series(df["close_price"].to_numpy(), index=idx, name="close_price").sort_index()
 
 
-# customization: H/L/C from SQLite for ADX(14); null legacy highs/lows default to close
-def _load_symbol_hlc(db_path: Path, symbol: str) -> tuple[pd.Series, pd.Series, pd.Series]:
+# customization: O/H/L/C from SQLite for ADX(14) and M2.1 next-day open execution
+def _load_symbol_ohlc(db_path: Path, symbol: str) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     with sqlite3.connect(db_path) as conn:
         df = pd.read_sql_query(
-            "SELECT date, high_price, low_price, close_price FROM market_history WHERE symbol = ? ORDER BY date",
+            "SELECT date, open_price, high_price, low_price, close_price FROM market_history WHERE symbol = ? ORDER BY date",
             conn,
             params=(symbol,),
         )
@@ -516,10 +564,12 @@ def _load_symbol_hlc(db_path: Path, symbol: str) -> tuple[pd.Series, pd.Series, 
     close = pd.to_numeric(df["close_price"], errors="coerce")
     high = pd.to_numeric(df["high_price"], errors="coerce").fillna(close)
     low = pd.to_numeric(df["low_price"], errors="coerce").fillna(close)
+    open_ = pd.to_numeric(df["open_price"], errors="coerce").fillna(close)
     hi = pd.Series(high.to_numpy(), index=idx, name="high_price").sort_index()
     lo = pd.Series(low.to_numpy(), index=idx, name="low_price").sort_index()
     cl = pd.Series(close.to_numpy(), index=idx, name="close_price").sort_index()
-    return hi, lo, cl
+    op = pd.Series(open_.to_numpy(), index=idx, name="open_price").sort_index()
+    return hi, lo, cl, op
 
 
 # customization: Wilder-style ADX (period 14) from high/low/close
@@ -744,7 +794,7 @@ def _build_data_manager(
         "SMR": _load_close_series(db_path, SMR_SQL),
     }
     # customization: aligned H/L/C per symbol for ADX(14) in triggers
-    hlc_by_symbol = {sym: _load_symbol_hlc(db_path, sym) for sym in _TICKERS}
+    hlc_by_symbol = {sym: _load_symbol_ohlc(db_path, sym) for sym in _TICKERS}
 
     # fill_forward: engine marks to market on calendar days (e.g. holidays) and RT series uses EOD clock, not midnight
     _mds = MissingDataStrategy.fill_forward
@@ -810,13 +860,14 @@ def _run_single_sma_window(
     use_atr_position_sizing: bool = False,
     use_regime_switching: bool = False,
     adx_trend_min: float = 25.0,
-    hlc_by_symbol: dict[str, tuple[pd.Series, pd.Series, pd.Series]] | None = None,
+    hlc_by_symbol: dict[str, tuple[pd.Series, pd.Series, pd.Series, pd.Series]] | None = None,
+    use_next_day_open: bool = False,
 ):
     triggers = []
     for symbol in instruments.keys():
-        hi = lo = None
+        hi = lo = op = None
         if hlc_by_symbol is not None and symbol in hlc_by_symbol:
-            hi, lo, _cl = hlc_by_symbol[symbol]
+            hi, lo, _cl, op = hlc_by_symbol[symbol]
         triggers.append(
             MACrossoverEODTrigger(
                 instruments[symbol],
@@ -831,6 +882,8 @@ def _run_single_sma_window(
                 adx_trend_min=float(adx_trend_min),
                 high_series=hi,
                 low_series=lo,
+                open_series=op if use_next_day_open else None,
+                use_next_day_open=use_next_day_open,
             )
         )
     strategy = Strategy(initial_portfolio=None, triggers=triggers)
@@ -855,6 +908,8 @@ def run(
     stop_loss_fraction: float = 0.10,
 ) -> None:
     sma_windows = sma_windows or [20]
+    _ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    _CHARTS_DIR.mkdir(parents=True, exist_ok=True)
     data_manager, close_by_symbol, instruments, hlc_by_symbol = _build_data_manager(db_path)
 
     rows: list[dict] = []
@@ -921,7 +976,7 @@ def run(
         plt.ylabel("Total NAV")
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig("backtest_result.png", dpi=150)
+        plt.savefig(_CHARTS_DIR / f"backtest_result_{_ts}.png", dpi=150)
         plt.close()
 
     print("=== SMA Window Ranking (by Annualized Sharpe, rf=0) ===")
@@ -969,6 +1024,8 @@ def run_stage5_retail_robustness(
     expanded retail metrics, ``stability_heatmap.png``, then same window on 2025 for OOS context.
     """
     iv = float(initial_value) if initial_value is not None else max(100_000.0, 2.2 * float(target_usd_allocation))
+    _ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    _CHARTS_DIR.mkdir(parents=True, exist_ok=True)
     start_2024, end_2024 = dt.date(2024, 1, 1), dt.date(2024, 12, 31)
     start_2025, end_2025 = dt.date(2025, 1, 1), dt.date(2025, 12, 31)
 
@@ -1196,8 +1253,48 @@ def run_stage5_retail_robustness(
     print(sweep9_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
     print("(Win/Loss Ratio = avg winning trade / avg losing trade; higher is better for asymmetric exits)")
 
-    _save_stability_heatmap(sweep_df, "stability_heatmap.png")
-    print("\nWrote stability_heatmap.png (2024 Sharpe vs SMA window).")
+    # M2.1: Next-Day Open Execution — Reality Check comparison vs M1.9 Close Execution (2025 OOS)
+    print("\n=== M2.1: Phase 2 Reality Check — Next-Day Open vs Close Execution (2025 OOS) ===")
+    # M1.9 baseline reuses bt25_s8 (Stage 9 regime switching, ADX=25, close execution)
+    bt_m21, _, nav_m21, sh_m21 = _run_single_sma_window(
+        start=start_2025,
+        end=end_2025,
+        data_manager=data_manager,
+        close_by_symbol=close_by_symbol,
+        instruments=instruments,
+        sma_window=best_w,
+        target_usd_allocation=float(target_usd_allocation),
+        fee_model=str(fee_model),
+        initial_value=iv,
+        slippage_fraction=float(slippage_fraction),
+        stop_loss_fraction=float(stop_loss_fraction),
+        use_atr_position_sizing=True,
+        use_regime_switching=True,
+        adx_trend_min=25.0,
+        hlc_by_symbol=hlc_by_symbol,
+        use_next_day_open=True,
+    )
+    tr_m19, _ = _nav_total_return_and_max_drawdown(nav25_s8)
+    tr_m21, _ = _nav_total_return_and_max_drawdown(nav_m21)
+    pf_m21 = _profit_factor_from_backtest(bt_m21)
+    comparison_m21 = pd.DataFrame([
+        {"Milestone": "M1.9 (Close Execution)", "Annualized_Sharpe": _s8_sh,
+         "Total_Return_pct": tr_m19, "Profit_Factor": pf_s8},
+        {"Milestone": "M2.1 (Next-Day Open)",   "Annualized_Sharpe": sh_m21,
+         "Total_Return_pct": tr_m21, "Profit_Factor": pf_m21},
+    ])
+    print(comparison_m21.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+    pf_m21_val = float(pf_m21)
+    if math.isfinite(pf_m21_val):
+        litmus = (
+            "PASS — strategy remains viable after execution lag"
+            if pf_m21_val >= 0.90
+            else "CAUTION — strategy may be scalping overnight gaps not capturable in live trading"
+        )
+        print(f"\nM2.1 Litmus Test (Profit Factor >= 0.90): {litmus} (value: {pf_m21_val:.4f})")
+
+    _save_stability_heatmap(sweep_df, str(_CHARTS_DIR / f"stability_heatmap_{_ts}.png"))
+    print(f"\nWrote charts/stability_heatmap_{_ts}.png (2024 Sharpe vs SMA window).")
 
     if len(nav25.dropna()):
         nav_plot = nav25.dropna().astype(float)
@@ -1208,7 +1305,7 @@ def run_stage5_retail_robustness(
         plt.ylabel("Total NAV")
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig("backtest_result.png", dpi=150)
+        plt.savefig(_CHARTS_DIR / f"backtest_result_{_ts}.png", dpi=150)
         plt.close()
 
     print("\nDone (Stage 9, no GsSession).")
