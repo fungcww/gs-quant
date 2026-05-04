@@ -1,6 +1,6 @@
 # Quant Framework Roadmap
 
-## Current Bookmark: Phase 2 → M2.1
+## Current Bookmark: Phase 3 → M3.1
 
 ---
 
@@ -14,23 +14,23 @@
 
 ---
 
-### Phase 2: The Reality Check ← CURRENT
-**Exit criteria:** Strategy viable after execution delays and gaps.
+### Phase 2: The Reality Check ✓ COMPLETE
+**Exit criteria met:** Strategy viable after execution delays and gaps.
 
 | Milestone | Description | Status |
 |-----------|-------------|--------|
-| **M2.1** | **Next-Day Open Execution — signals on Close T fill at Open T+1. open_price persisted in market.db. M1.9 vs M2.1 comparison table (Sharpe, Total Return, Profit Factor). Litmus: PF >= 0.90.** | **Current** |
+| M2.1 | Next-Day Open Execution — signals on Close T fill at Open T+1. open_price persisted in market.db. M1.9 vs M2.1 comparison table (Sharpe, Total Return, Profit Factor). Litmus: PF >= 0.90. | Done |
 | M2.2 | Transaction Cost & Market Impact Modeling | Pending |
 
 ---
 
-### Phase 3: Risk & Portfolio Engineering
+### Phase 3: Risk & Portfolio Engineering ← CURRENT
 **Exit criteria:** Stable equity curve across a basket of diverse assets.
 
-| Milestone | Description |
-|-----------|-------------|
-| M3.1 | Multi-symbol Correlation Analysis |
-| M3.2 | Volatility-Adjusted Position Sizing (Full Portfolio) |
+| Milestone | Description | Status |
+|-----------|-------------|--------|
+| **M3.1** | **10-ticker universe (AAPL, SMR, NVDA, TSLA, GOOGL, MSFT, META, AMD, NNE, OKLO). Pearson correlation matrix (2024 in-sample). 30-day rolling correlation gate (threshold 0.70). Portfolio Total NAV report + Diversification Benefit metric. Parallel yfinance download.** | **Current** |
+| M3.2 | Volatility-Adjusted Position Sizing (Full Portfolio) | Pending |
 
 ---
 
@@ -52,3 +52,4 @@
 | 8 | Regime Switching — ADX gear-shifter: Trend (ADX>25, SMA crossover) vs Mean Reversion (ADX<20, BB lower touch). ATR sizing + Chandelier stop. |
 | 9 | Asymmetric Mean Reversion — RSI(14)<30 + BB lower touch entry; Upper BB exit. ADX threshold hysteresis sweep. OOS Win/Loss Ratio. |
 | 10 / M2.1 | Next-Day Open Execution — `open_price` added to market.db; fills shift from signal-day Close to T+1 Open via `override_fill_price`. M1.9 vs M2.1 comparison printed at run end. |
+| 31 / M3.1 | **Default stage.** 10-ticker universe; parallel yfinance download; Pearson correlation matrix (2024); 30-day rolling corr gate (0.70); combined portfolio Total NAV + Diversification Benefit. `--stage 6` restores legacy 2-ticker run. |

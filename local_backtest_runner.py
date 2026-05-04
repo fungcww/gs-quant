@@ -33,6 +33,7 @@ import argparse
 import datetime as dt
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -65,7 +66,7 @@ _EOD = dt.time(23, 0, 0)
 _MARKET_OPEN = dt.time(9, 30, 0)
 
 
-_TICKERS = ("AAPL", "SMR")
+_TICKERS = ("AAPL", "SMR", "NVDA", "TSLA", "GOOGL", "MSFT", "META", "AMD", "NNE", "OKLO")
 _DATA_START = "2024-01-01"
 _DATA_END_EXCLUSIVE = "2026-01-01"  # yfinance daily ``end`` is exclusive; includes all of 2025-12-31
 
@@ -112,19 +113,10 @@ class OrderAtMarketWithSlippage(OrderAtMarket):
         return self.executed_price
 
 
-AAPL_SQL = """
-SELECT date, close_price
-FROM market_history
-WHERE symbol = 'AAPL'
-ORDER BY date
-"""
+def _close_sql(symbol: str) -> str:
+    """Parameterised close-price query for a single symbol (symbol is always from _TICKERS)."""
+    return f"SELECT date, close_price FROM market_history WHERE symbol = '{symbol}' ORDER BY date"
 
-SMR_SQL = """
-SELECT date, close_price
-FROM market_history
-WHERE symbol = 'SMR'
-ORDER BY date
-"""
 
 
 
@@ -137,22 +129,47 @@ def _repo_root() -> Path:
 _CHARTS_DIR = _repo_root() / "charts"
 
 
+def _fetch_ticker_history(symbol: str, start: str, end: str) -> tuple[str, "pd.DataFrame"]:
+    """Download OHLCV for one ticker; runs in a thread (I/O-bound)."""
+    import yfinance as yf  # type: ignore[import-untyped]
+    hist = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=False)
+    return symbol, hist
+
+
 def ensure_market_db(db_path: Path) -> None:
-    """Create ``market_history`` if needed and load AAPL/SMR daily closes from yfinance into ``market.db``."""
+    """Create ``market_history`` if needed and load all _TICKERS daily OHLC from yfinance into ``market.db``.
+
+    Downloads are issued in parallel via ThreadPoolExecutor (I/O-bound); indicator pre-computation
+    (ADX, RSI, SMA) is already vectorised over the full series so no further parallelism is needed there.
+    Backtests are kept sequential because PredefinedAssetEngine holds mutable state that is not picklable.
+    """
     try:
-        import yfinance as yf  # type: ignore[import-untyped]
+        import yfinance as yf  # noqa: F401 — validate install before spawning threads
     except ImportError as e:
         raise RuntimeError(
             "yfinance is required for real-world data ingestion. Install with: pip install yfinance"
         ) from e
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    rows: list[tuple[str, str, float, float, float, float, int]] = []
 
+    # Parallel download — one thread per ticker, capped at 8 to avoid rate-limiting
+    print(f"Fetching {len(_TICKERS)} tickers from yfinance (parallel)…")
+    hist_by_sym: dict[str, "pd.DataFrame"] = {}
+    with ThreadPoolExecutor(max_workers=min(len(_TICKERS), 8)) as pool:
+        futures = {
+            pool.submit(_fetch_ticker_history, sym, _DATA_START, _DATA_END_EXCLUSIVE): sym
+            for sym in _TICKERS
+        }
+        for fut in as_completed(futures):
+            sym, hist = fut.result()
+            if hist.empty:
+                raise RuntimeError(f"yfinance returned no rows for {sym!r}; check connectivity or ticker.")
+            hist_by_sym[sym] = hist
+            print(f"  {sym}: {len(hist)} bars")
+
+    rows: list[tuple[str, str, float, float, float, float, int]] = []
     for symbol in _TICKERS:
-        hist = yf.Ticker(symbol).history(start=_DATA_START, end=_DATA_END_EXCLUSIVE, auto_adjust=False)
-        if hist.empty:
-            raise RuntimeError(f"yfinance returned no rows for {symbol!r}; check connectivity or ticker.")
+        hist = hist_by_sym[symbol]
         for ts, bar in hist.iterrows():
             close = bar.get("Close")
             if close is None or (isinstance(close, float) and pd.isna(close)):
@@ -258,6 +275,10 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         # M2.1: execute fills at next-day open instead of signal-day close
         use_next_day_open: bool = False,
         open_series: pd.Series | None = None,
+        # M3.1: correlation gate — block new buys when 30-day rolling corr to any held position >= threshold
+        corr_data: dict[str, pd.Series] | None = None,
+        corr_threshold: float = 0.70,
+        corr_window: int = 30,
     ):
         super().__init__()
         s = close_series.copy()
@@ -336,8 +357,47 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
             op = op.sort_index().reindex(self._closes.index).astype(float)
             self._next_open = op.shift(-1)
 
+        # M3.1: correlation gate state
+        self._corr_data: dict[str, pd.Series] | None = corr_data
+        self._corr_threshold = float(corr_threshold)
+        self._corr_window = int(corr_window)
+        self._my_symbol = str(self._instrument.name) if hasattr(self._instrument, "name") else ""
+
         if self._fee_model not in {"futu_us_stock", "none"}:
             raise ValueError(f"Unsupported fee_model={self._fee_model!r}; expected 'futu_us_stock' or 'none'.")
+
+    def _rolling_corr_gate(self, i: int, backtest) -> bool:
+        """Return True (block entry) when 30-day rolling correlation to any held position >= threshold."""
+        if self._corr_data is None or backtest is None:
+            return False
+        holdings = getattr(backtest, "holdings", {})
+        held_syms = [
+            str(getattr(inst, "name", ""))
+            for inst, qty in holdings.items()
+            if float(qty) > 1e-9 and str(getattr(inst, "name", "")) != self._my_symbol
+        ]
+        if not held_syms:
+            return False
+        w = self._corr_window
+        # need w+1 prices to get w returns; bail out if not enough history
+        if i < w + 1:
+            return False
+        my_prices = self._closes.iloc[i - w - 1 : i]
+        my_ret = my_prices.pct_change().dropna()
+        for sym in held_syms:
+            other_s = self._corr_data.get(sym)
+            if other_s is None:
+                continue
+            other_s = other_s.reindex(self._closes.index).ffill()
+            other_prices = other_s.iloc[i - w - 1 : i]
+            other_ret = other_prices.pct_change().dropna()
+            combined = pd.concat([my_ret, other_ret], axis=1).dropna()
+            if len(combined) < 10:
+                continue
+            corr = float(combined.iloc[:, 0].corr(combined.iloc[:, 1]))
+            if math.isfinite(corr) and abs(corr) >= self._corr_threshold:
+                return True
+        return False
 
     def get_trigger_times(self) -> list:
         return [self._eod]
@@ -445,6 +505,9 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
             if not buy_signal:
                 return []
             if close_t <= self._eps:
+                return []
+            # M3.1: block entry when too correlated to an existing position
+            if self._rolling_corr_gate(i, backtest):
                 return []
 
             # position sizing: ATR inverse-vol (Stage 7+) or fixed dollar (Stage 6)
@@ -787,58 +850,41 @@ def _annualized_sharpe_from_nav(nav: pd.Series, annualization_factor: int = 252)
 
 def _build_data_manager(
     db_path: Path,
+    symbols: list[str] | None = None,
 ) -> tuple[DataManager, dict[str, pd.Series], dict[str, EqStock], dict[str, tuple[pd.Series, pd.Series, pd.Series]]]:
+    """Build a DataManager for ``symbols`` (defaults to all ``_TICKERS``)."""
+    if symbols is None:
+        symbols = list(_TICKERS)
     ensure_market_db(db_path)
-    close_by_symbol = {
-        "AAPL": _load_close_series(db_path, AAPL_SQL),
-        "SMR": _load_close_series(db_path, SMR_SQL),
-    }
-    # customization: aligned H/L/C per symbol for ADX(14) in triggers
-    hlc_by_symbol = {sym: _load_symbol_ohlc(db_path, sym) for sym in _TICKERS}
 
-    # fill_forward: engine marks to market on calendar days (e.g. holidays) and RT series uses EOD clock, not midnight
+    close_by_symbol = {sym: _load_close_series(db_path, _close_sql(sym)) for sym in symbols}
+    hlc_by_symbol = {sym: _load_symbol_ohlc(db_path, sym) for sym in symbols}
+
     _mds = MissingDataStrategy.fill_forward
-    apple_daily = SQLiteDataSource(
-        db_path=str(db_path),
-        sql=AAPL_SQL,
-        date_column="date",
-        value_column="close_price",
-        missing_data_strategy=_mds,
-    )
-    apple_rt = SQLiteDataSource(
-        db_path=str(db_path),
-        sql=AAPL_SQL,
-        date_column="date",
-        value_column="close_price",
-        index_at_time=_EOD,
-        missing_data_strategy=_mds,
-    )
-    smr_daily = SQLiteDataSource(
-        db_path=str(db_path),
-        sql=SMR_SQL,
-        date_column="date",
-        value_column="close_price",
-        missing_data_strategy=_mds,
-    )
-    smr_rt = SQLiteDataSource(
-        db_path=str(db_path),
-        sql=SMR_SQL,
-        date_column="date",
-        value_column="close_price",
-        index_at_time=_EOD,
-        missing_data_strategy=_mds,
-    )
-
-    instruments = {
-        "AAPL": EqStock(name="AAPL", currency="USD", quantity=1),
-        "SMR": EqStock(name="SMR", currency="USD", quantity=1),
-    }
-
+    instruments: dict[str, EqStock] = {}
     data_manager = DataManager()
-    data_manager.add_data_source(apple_daily, DataFrequency.DAILY, instruments["AAPL"], ValuationFixingType.PRICE)
-    data_manager.add_data_source(apple_rt, DataFrequency.REAL_TIME, instruments["AAPL"], ValuationFixingType.PRICE)
-    data_manager.add_data_source(smr_daily, DataFrequency.DAILY, instruments["SMR"], ValuationFixingType.PRICE)
-    data_manager.add_data_source(smr_rt, DataFrequency.REAL_TIME, instruments["SMR"], ValuationFixingType.PRICE)
+
+    for sym in symbols:
+        sql = _close_sql(sym)
+        inst = EqStock(name=sym, currency="USD", quantity=1)
+        instruments[sym] = inst
+        daily_src = SQLiteDataSource(
+            db_path=str(db_path),
+            sql=sql,
+            date_column="date",
+            value_column="close_price",
+            missing_data_strategy=_mds,
+        )
+        rt_src = SQLiteDataSource(
+            db_path=str(db_path),
+            sql=sql,
+            date_column="date",
+            value_column="close_price",
+            index_at_time=_EOD,
+            missing_data_strategy=_mds,
+        )
+        data_manager.add_data_source(daily_src, DataFrequency.DAILY, inst, ValuationFixingType.PRICE)
+        data_manager.add_data_source(rt_src, DataFrequency.REAL_TIME, inst, ValuationFixingType.PRICE)
 
     return data_manager, close_by_symbol, instruments, hlc_by_symbol
 
@@ -862,6 +908,10 @@ def _run_single_sma_window(
     adx_trend_min: float = 25.0,
     hlc_by_symbol: dict[str, tuple[pd.Series, pd.Series, pd.Series, pd.Series]] | None = None,
     use_next_day_open: bool = False,
+    # M3.1 correlation gate (pass close_by_symbol dict to enable; None disables)
+    corr_data: dict[str, pd.Series] | None = None,
+    corr_threshold: float = 0.70,
+    corr_window: int = 30,
 ):
     triggers = []
     for symbol in instruments.keys():
@@ -884,6 +934,9 @@ def _run_single_sma_window(
                 low_series=lo,
                 open_series=op if use_next_day_open else None,
                 use_next_day_open=use_next_day_open,
+                corr_data=corr_data,
+                corr_threshold=corr_threshold,
+                corr_window=corr_window,
             )
         )
     strategy = Strategy(initial_portfolio=None, triggers=triggers)
@@ -1311,6 +1364,165 @@ def run_stage5_retail_robustness(
     print("\nDone (Stage 9, no GsSession).")
 
 
+def _compute_correlation_matrix(
+    close_by_symbol: dict[str, pd.Series],
+    start: dt.date,
+    end: dt.date,
+) -> "pd.DataFrame":
+    """Pearson correlation matrix of daily returns over [start, end] (inclusive)."""
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    frames: dict[str, pd.Series] = {}
+    for sym, s in close_by_symbol.items():
+        s2 = s.astype(float).dropna()
+        mask = (s2.index >= start_ts) & (s2.index <= end_ts)
+        frames[sym] = s2[mask].pct_change()
+    ret_df = pd.DataFrame(frames).dropna(how="all")
+    return ret_df.corr(method="pearson").round(4)
+
+
+def run_m31_portfolio(
+    db_path: Path,
+    *,
+    sma_window: int = 20,
+    target_usd_allocation: float = 25_000.0,
+    fee_model: str = "futu_us_stock",
+    initial_value: float | None = None,
+    slippage_fraction: float = DEFAULT_SLIPPAGE_FRACTION,
+    corr_threshold: float = 0.70,
+    corr_window: int = 30,
+) -> None:
+    """
+    M3.1 — Multi-Symbol Correlation & Scaling.
+
+    1. Downloads & ingests 10-ticker universe (parallel via ThreadPoolExecutor).
+    2. Prints Pearson Correlation Matrix (2024 in-sample daily returns).
+    3. Runs combined portfolio backtest (2025 OOS, M2.1 execution, correlation gate).
+    4. Runs per-ticker individual backtests (no correlation gate) for baseline MDD.
+    5. Prints Diversification Benefit = avg(individual MDD) − portfolio MDD.
+    """
+    iv = float(initial_value) if initial_value is not None else max(
+        1_000_000.0, 3.0 * float(target_usd_allocation) * len(_TICKERS)
+    )
+    _ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    _CHARTS_DIR.mkdir(parents=True, exist_ok=True)
+    start_2024 = dt.date(2024, 1, 1)
+    end_2024 = dt.date(2024, 12, 31)
+    start_2025 = dt.date(2025, 1, 1)
+    end_2025 = dt.date(2025, 12, 31)
+
+    print(f"=== M3.1: Multi-Symbol Portfolio — {len(_TICKERS)}-ticker universe ===")
+    print(f"Tickers: {', '.join(_TICKERS)}\n")
+
+    # Build data manager (triggers parallel yfinance download for all tickers)
+    data_manager, close_by_symbol, instruments, hlc_by_symbol = _build_data_manager(db_path)
+
+    # ── 1. Pearson Correlation Matrix (2024 in-sample) ─────────────────────────
+    print("=== Pearson Correlation Matrix (2024 in-sample daily returns) ===")
+    corr_matrix = _compute_correlation_matrix(close_by_symbol, start_2024, end_2024)
+    print(corr_matrix.to_string(float_format=lambda x: f"{x:+.3f}"))
+    print()
+
+    # ── 2. Combined portfolio backtest (2025 OOS, correlation gate ON) ─────────
+    print("=== Combined Portfolio Backtest (2025 OOS, M2.1 execution, corr gate ON) ===")
+    bt_port, _, nav_port, sh_port = _run_single_sma_window(
+        start=start_2025,
+        end=end_2025,
+        data_manager=data_manager,
+        close_by_symbol=close_by_symbol,
+        instruments=instruments,
+        sma_window=sma_window,
+        target_usd_allocation=float(target_usd_allocation),
+        fee_model=fee_model,
+        initial_value=iv,
+        slippage_fraction=slippage_fraction,
+        use_atr_position_sizing=True,
+        use_regime_switching=True,
+        adx_trend_min=25.0,
+        hlc_by_symbol=hlc_by_symbol,
+        use_next_day_open=True,
+        corr_data=close_by_symbol,
+        corr_threshold=corr_threshold,
+        corr_window=corr_window,
+    )
+    tr_port, mdd_port = _nav_total_return_and_max_drawdown(nav_port)
+    pf_port = _profit_factor_from_backtest(bt_port)
+
+    # ── 3. Individual ticker backtests (no corr gate, shared data_manager) ─────
+    print("\n=== Individual Ticker Performance (2025 OOS, no correlation gate) ===")
+    ind_iv = max(100_000.0, 2.5 * float(target_usd_allocation))
+    individual_rows: list[dict] = []
+    for sym in _TICKERS:
+        _, _, nav_i, sh_i = _run_single_sma_window(
+            start=start_2025,
+            end=end_2025,
+            data_manager=data_manager,
+            close_by_symbol={sym: close_by_symbol[sym]},
+            instruments={sym: instruments[sym]},
+            sma_window=sma_window,
+            target_usd_allocation=float(target_usd_allocation),
+            fee_model=fee_model,
+            initial_value=ind_iv,
+            slippage_fraction=slippage_fraction,
+            use_atr_position_sizing=True,
+            use_regime_switching=True,
+            adx_trend_min=25.0,
+            hlc_by_symbol={sym: hlc_by_symbol[sym]},
+            use_next_day_open=True,
+        )
+        tr_i, mdd_i = _nav_total_return_and_max_drawdown(nav_i)
+        mdd_i_abs = abs(float(mdd_i)) if math.isfinite(float(mdd_i)) else float("nan")
+        individual_rows.append(
+            {"Symbol": sym, "Sharpe": sh_i, "Total_Return_pct": tr_i, "Max_Drawdown_pct": mdd_i_abs}
+        )
+        sharpe_s = f"{sh_i:.4f}" if math.isfinite(sh_i) else "N/A"
+        print(f"  {sym:5s}  Sharpe={sharpe_s:>8}  Return={tr_i:+.2f}%  MaxDD={mdd_i_abs:.2f}%")
+
+    ind_df = pd.DataFrame(individual_rows)
+    avg_ind_mdd = float(ind_df["Max_Drawdown_pct"].dropna().mean())
+    port_mdd_abs = abs(float(mdd_port)) if math.isfinite(float(mdd_port)) else float("nan")
+    divers_benefit = avg_ind_mdd - port_mdd_abs
+
+    # ── 4. Final report ────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("=== M3.1 Combined Portfolio Report (2025 OOS) ===")
+    print("=" * 60)
+    sharpe_s = f"{sh_port:.4f}" if math.isfinite(sh_port) else "N/A"
+    pf_s = f"{pf_port:.4f}" if math.isfinite(pf_port) else ("inf" if pf_port == float("inf") else "N/A")
+    print(f"Portfolio Annualized Sharpe :  {sharpe_s}")
+    print(f"Portfolio Total Return      :  {tr_port:+.4f}%")
+    print(f"Portfolio Max Drawdown      :  {port_mdd_abs:.4f}%")
+    print(f"Portfolio Profit Factor     :  {pf_s}")
+    print()
+    print(f"Avg Individual Max Drawdown :  {avg_ind_mdd:.4f}%")
+    print(f"Portfolio Max Drawdown      :  {port_mdd_abs:.4f}%")
+    sign = "+" if divers_benefit >= 0 else ""
+    print(f"Diversification Benefit     :  {sign}{divers_benefit:.4f}%  (positive = correlation filter reduced drawdown)")
+    print(f"\nCorrelation gate: 30-day rolling Pearson threshold = {corr_threshold:.0%}")
+    print(f"Universe: {', '.join(_TICKERS)}")
+
+    # Plot portfolio equity curve
+    if len(nav_port.dropna()):
+        nav_plot = nav_port.dropna().astype(float)
+        plt.figure(figsize=(12, 5))
+        plt.plot(nav_plot.index, nav_plot.values, linewidth=1.5, color="steelblue", label="Portfolio Total NAV")
+        plt.title(
+            f"M3.1 Combined Portfolio Equity Curve — 2025 OOS\n"
+            f"{len(_TICKERS)} tickers, corr gate {corr_threshold:.0%}, SMA={sma_window}"
+        )
+        plt.xlabel("Date")
+        plt.ylabel("Total NAV (USD)")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        out = _CHARTS_DIR / f"m31_portfolio_{_ts}.png"
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"\nWrote {out}")
+
+    print("\nDone (M3.1, no GsSession).")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Local SQLite PredefinedAssetEngine MA crossover demo")
     parser.add_argument(
@@ -1328,7 +1540,17 @@ def main() -> None:
         "--initial-value",
         type=float,
         default=None,
-        help="Starting portfolio NAV in USD (default: max(100k, 2.2× per-symbol target) for Stage 6)",
+        help="Starting portfolio NAV in USD",
+    )
+    parser.add_argument(
+        "--stage",
+        type=int,
+        default=31,
+        choices=[6, 9, 10, 31],
+        help=(
+            "Stage to run: 6/9/10 = legacy Stage 6–M2.1 robustness suite (2-ticker); "
+            "31 = M3.1 multi-symbol portfolio with correlation engine (default)"
+        ),
     )
     args = parser.parse_args()
     if args.quick:
@@ -1348,13 +1570,20 @@ def main() -> None:
             raise
         return
     try:
-        run_stage5_retail_robustness(
-            args.db.resolve(),
-            sma_sweep_windows=[5, 10, 15, 20, 30, 50],
-            target_usd_allocation=25_000.0,
-            fee_model="futu_us_stock",
-            initial_value=args.initial_value,
-        )
+        if args.stage == 31:
+            run_m31_portfolio(
+                args.db.resolve(),
+                initial_value=args.initial_value,
+            )
+        else:
+            # stages 6 / 9 / 10 — legacy 2-ticker robustness suite
+            run_stage5_retail_robustness(
+                args.db.resolve(),
+                sma_sweep_windows=[5, 10, 15, 20, 30, 50],
+                target_usd_allocation=25_000.0,
+                fee_model="futu_us_stock",
+                initial_value=args.initial_value,
+            )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         raise
