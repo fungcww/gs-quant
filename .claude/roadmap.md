@@ -1,6 +1,6 @@
 # Quant Framework Roadmap
 
-## Current Bookmark: Phase 3 → M3.1
+## Current Bookmark: Phase 3 → M3.2
 
 ---
 
@@ -29,8 +29,8 @@
 
 | Milestone | Description | Status |
 |-----------|-------------|--------|
-| **M3.1** | **10-ticker universe (AAPL, SMR, NVDA, TSLA, GOOGL, MSFT, META, AMD, NNE, OKLO). Pearson correlation matrix (2024 in-sample). 30-day rolling correlation gate (threshold 0.70). Portfolio Total NAV report + Diversification Benefit metric. Parallel yfinance download.** | **Current** |
-| M3.2 | Volatility-Adjusted Position Sizing (Full Portfolio) | Pending |
+| M3.1 | 10-ticker universe (AAPL, SMR, NVDA, TSLA, GOOGL, MSFT, META, AMD, NNE, OKLO). Pearson correlation matrix (2024 in-sample). 30-day rolling correlation gate (threshold 0.70). Portfolio Total NAV report + Diversification Benefit metric. Parallel yfinance download. | Done |
+| **M3.2** | **Retail Inverse-Vol Sizing. Initial equity $10K default (`--initial-value`). 20-day rolling std sizing: risk_usd = 0.5% NAV ÷ (price × vol). Fractional shares. corr_threshold tightened to 0.45. Position notional printed per trade. ATR Chandelier stop preserved.** | **Current** |
 
 ---
 
@@ -52,4 +52,5 @@
 | 8 | Regime Switching — ADX gear-shifter: Trend (ADX>25, SMA crossover) vs Mean Reversion (ADX<20, BB lower touch). ATR sizing + Chandelier stop. |
 | 9 | Asymmetric Mean Reversion — RSI(14)<30 + BB lower touch entry; Upper BB exit. ADX threshold hysteresis sweep. OOS Win/Loss Ratio. |
 | 10 / M2.1 | Next-Day Open Execution — `open_price` added to market.db; fills shift from signal-day Close to T+1 Open via `override_fill_price`. M1.9 vs M2.1 comparison printed at run end. |
-| 31 / M3.1 | **Default stage.** 10-ticker universe; parallel yfinance download; Pearson correlation matrix (2024); 30-day rolling corr gate (0.70); combined portfolio Total NAV + Diversification Benefit. `--stage 6` restores legacy 2-ticker run. |
+| 31 / M3.1 | 10-ticker universe; parallel yfinance download; Pearson correlation matrix (2024); 30-day rolling corr gate (0.70); combined portfolio Total NAV + Diversification Benefit. |
+| 32 / M3.2 | **Default stage.** Retail inverse-vol sizing ($10K equity, corr 0.45, fractional shares, 0.5% daily-vol-risk per trade). `--stage 31` restores M3.1. |

@@ -20,11 +20,16 @@ Local backtest using PredefinedAssetEngine + SQLiteDataSource (no GsSession / Ma
   signal-day Close to the Open of Day T+1. ``open_price`` is persisted in ``market.db`` via yfinance.
   A comparison table (M1.9 Close vs M2.1 Open) is printed for 2025 OOS Sharpe, Total Return, and Profit
   Factor. Litmus test: Profit Factor >= 0.90 confirms the strategy is not scalping unreachable overnight gaps.
+- Stage 32 / M3.2 (Inverse-Volatility Sizing, Retail): Retail-optimised portfolio (default $10,000 equity).
+  Replaces ATR entry sizing with 20-day rolling-std inverse-vol sizing targeting 0.5% daily-vol-risk per
+  trade. Fractional shares supported. Correlation threshold tightened to 0.45 to cap sector concentration
+  risk for small accounts. ATR Chandelier trailing stop is preserved. Position notional printed per trade.
 
 Run from the repository root::
 
-    python local_backtest_runner.py              # Stage 9 full run (retail robustness + regime comparison)
-    python local_backtest_runner.py --quick   # one week smoke test
+    python local_backtest_runner.py              # Stage 32 M3.2 retail portfolio (default)
+    python local_backtest_runner.py --stage 31  # M3.1 multi-symbol portfolio (legacy default)
+    python local_backtest_runner.py --quick      # one week smoke test
 """
 
 from __future__ import annotations
@@ -279,6 +284,10 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         corr_data: dict[str, pd.Series] | None = None,
         corr_threshold: float = 0.70,
         corr_window: int = 30,
+        # M3.2: inverse-volatility sizing (20-day rolling std of % returns, 0.5% daily-vol-risk per trade)
+        use_vol_sizing: bool = False,
+        vol_lookback: int = 20,
+        vol_risk_fraction: float = 0.005,
     ):
         super().__init__()
         s = close_series.copy()
@@ -362,6 +371,14 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
         self._corr_threshold = float(corr_threshold)
         self._corr_window = int(corr_window)
         self._my_symbol = str(self._instrument.name) if hasattr(self._instrument, "name") else ""
+
+        # M3.2: inverse-volatility sizing state
+        self._use_vol_sizing = bool(use_vol_sizing)
+        self._vol_lookback = int(vol_lookback)
+        self._vol_risk_fraction = float(vol_risk_fraction)
+        self._vol20: pd.Series | None = None
+        if self._use_vol_sizing:
+            self._vol20 = _vol_from_close(self._closes, window=self._vol_lookback)
 
         if self._fee_model not in {"futu_us_stock", "none"}:
             raise ValueError(f"Unsupported fee_model={self._fee_model!r}; expected 'futu_us_stock' or 'none'.")
@@ -510,8 +527,41 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
             if self._rolling_corr_gate(i, backtest):
                 return []
 
-            # position sizing: ATR inverse-vol (Stage 7+) or fixed dollar (Stage 6)
-            if self._use_atr_position_sizing:
+            # position sizing: inverse-vol (M3.2), ATR (Stage 7+), or fixed dollar (Stage 6)
+            if self._use_vol_sizing:
+                # M3.2: fractional shares; risk_usd = 0.5% NAV; shares = risk / (price × vol)
+                if self._vol20 is None:
+                    return []
+                vol_raw = self._vol20.iloc[i] if i < len(self._vol20) else float("nan")
+                vol_t = float(vol_raw) if not pd.isna(vol_raw) else float("nan")
+                if not math.isfinite(vol_t) or vol_t <= self._eps:
+                    return []
+                nav = self._latest_nav_usd(backtest)
+                if not math.isfinite(nav) or nav <= self._eps:
+                    return []
+                risk_usd = nav * self._vol_risk_fraction
+                # Inverse-vol sizing: qty so that a 1-sigma daily move costs exactly risk_usd.
+                #   qty = risk_usd / (price × σ_daily)
+                # vol_t is a 1-sigma estimate (68th-percentile daily outcome), NOT a worst-case.
+                # A stock going to zero is a ~10–20 sigma event; sizing for that would make
+                # positions tiny and returns negligible. Two-layer protection instead:
+                #   Layer 1 — this formula: keeps daily P&L smooth on a "normal Tuesday."
+                #   Layer 2 — ATR Chandelier stop: emergency brake that exits before a
+                #             multi-ATR collapse can turn into a catastrophic loss.
+                # To target a 2-sigma move (95% of days within budget), callers can set
+                # vol_risk_fraction=0.0025 (half of 0.5%) or multiply vol_t by 2 here.
+                qty = risk_usd / (_fill_ref * vol_t)
+                max_shares = (nav * self._atr_max_alloc_fraction) / _fill_ref
+                qty = min(qty, max_shares)
+                if qty <= self._eps:
+                    return []
+                sym_name = self._my_symbol or "?"
+                notional = qty * buy_px_fee
+                print(
+                    f"  [M3.2] {sym_name} BUY  {qty:.4f} sh × ${_fill_ref:.2f}"
+                    f" = ${notional:.2f} notional | 20d-vol={vol_t:.4f} | risk=${risk_usd:.2f}"
+                )
+            elif self._use_atr_position_sizing:
                 if self._atr is None:
                     return []
                 atr_raw = self._atr.iloc[i] if i < len(self._atr) else float("nan")
@@ -527,12 +577,14 @@ class MACrossoverEODTrigger(OrdersGeneratorTrigger):
                 # cap max allocation to avoid over-sizing in low-volatility periods
                 max_shares = int(math.floor((nav * self._atr_max_alloc_fraction) / _fill_ref))
                 qty = int(min(qty, max_shares))
+                if qty <= 0:
+                    return []
             else:
                 if self._target_usd <= self._eps:
                     return []
                 qty = int(math.floor(self._target_usd / _fill_ref))
-            if qty <= 0:
-                return []
+                if qty <= 0:
+                    return []
 
             self._purchase_price = buy_px_fee
             self._highest_close_since_entry = close_t
@@ -683,6 +735,14 @@ def _atr_from_hlc(high: pd.Series, low: pd.Series, close: pd.Series, *, period: 
     tr = pd.concat([h - lo, (h - prev_c).abs(), (lo - prev_c).abs()], axis=1).max(axis=1)
     atr = tr.rolling(int(period), min_periods=int(period)).mean()
     return atr.reindex(c.index)
+
+
+# M3.2: 20-day rolling std of daily % returns — numpy for pct computation, pandas rolling for window
+def _vol_from_close(close: pd.Series, *, window: int = 20) -> pd.Series:
+    c = close.astype(float).to_numpy()
+    # numpy pct-change: avoids pandas overhead in tight inner loops
+    pct = np.concatenate([[np.nan], np.diff(c) / np.where(c[:-1] == 0.0, np.nan, c[:-1])])
+    return pd.Series(pct, index=close.index).rolling(window, min_periods=window).std()
 
 
 def _max_drawdown_duration_days(nav: pd.Series) -> int:
@@ -912,6 +972,8 @@ def _run_single_sma_window(
     corr_data: dict[str, pd.Series] | None = None,
     corr_threshold: float = 0.70,
     corr_window: int = 30,
+    # M3.2: inverse-volatility position sizing (fractional shares, 0.5% daily-vol-risk per trade)
+    use_vol_sizing: bool = False,
 ):
     triggers = []
     for symbol in instruments.keys():
@@ -937,6 +999,7 @@ def _run_single_sma_window(
                 corr_data=corr_data,
                 corr_threshold=corr_threshold,
                 corr_window=corr_window,
+                use_vol_sizing=bool(use_vol_sizing),
             )
         )
     strategy = Strategy(initial_portfolio=None, triggers=triggers)
@@ -1391,6 +1454,7 @@ def run_m31_portfolio(
     slippage_fraction: float = DEFAULT_SLIPPAGE_FRACTION,
     corr_threshold: float = 0.70,
     corr_window: int = 30,
+    use_vol_sizing: bool = False,
 ) -> None:
     """
     M3.1 — Multi-Symbol Correlation & Scaling.
@@ -1401,9 +1465,13 @@ def run_m31_portfolio(
     4. Runs per-ticker individual backtests (no correlation gate) for baseline MDD.
     5. Prints Diversification Benefit = avg(individual MDD) − portfolio MDD.
     """
-    iv = float(initial_value) if initial_value is not None else max(
-        1_000_000.0, 3.0 * float(target_usd_allocation) * len(_TICKERS)
-    )
+    # M3.2 retail path: default $10K; M3.1 legacy path: scale with fixed target allocation
+    if initial_value is not None:
+        iv = float(initial_value)
+    elif use_vol_sizing:
+        iv = 10_000.0
+    else:
+        iv = max(1_000_000.0, 3.0 * float(target_usd_allocation) * len(_TICKERS))
     _ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     _CHARTS_DIR.mkdir(parents=True, exist_ok=True)
     start_2024 = dt.date(2024, 1, 1)
@@ -1444,13 +1512,14 @@ def run_m31_portfolio(
         corr_data=close_by_symbol,
         corr_threshold=corr_threshold,
         corr_window=corr_window,
+        use_vol_sizing=use_vol_sizing,
     )
     tr_port, mdd_port = _nav_total_return_and_max_drawdown(nav_port)
     pf_port = _profit_factor_from_backtest(bt_port)
 
     # ── 3. Individual ticker backtests (no corr gate, shared data_manager) ─────
     print("\n=== Individual Ticker Performance (2025 OOS, no correlation gate) ===")
-    ind_iv = max(100_000.0, 2.5 * float(target_usd_allocation))
+    ind_iv = iv / len(_TICKERS) if use_vol_sizing else max(100_000.0, 2.5 * float(target_usd_allocation))
     individual_rows: list[dict] = []
     for sym in _TICKERS:
         _, _, nav_i, sh_i = _run_single_sma_window(
@@ -1469,6 +1538,7 @@ def run_m31_portfolio(
             adx_trend_min=25.0,
             hlc_by_symbol={sym: hlc_by_symbol[sym]},
             use_next_day_open=True,
+            use_vol_sizing=use_vol_sizing,
         )
         tr_i, mdd_i = _nav_total_return_and_max_drawdown(nav_i)
         mdd_i_abs = abs(float(mdd_i)) if math.isfinite(float(mdd_i)) else float("nan")
@@ -1498,7 +1568,10 @@ def run_m31_portfolio(
     print(f"Portfolio Max Drawdown      :  {port_mdd_abs:.4f}%")
     sign = "+" if divers_benefit >= 0 else ""
     print(f"Diversification Benefit     :  {sign}{divers_benefit:.4f}%  (positive = correlation filter reduced drawdown)")
-    print(f"\nCorrelation gate: 30-day rolling Pearson threshold = {corr_threshold:.0%}")
+    sizing_mode = "Inverse-Vol (M3.2, 0.5% daily-vol-risk, fractional shares)" if use_vol_sizing else "ATR (Stage 7)"
+    print(f"\nPosition sizing      :  {sizing_mode}")
+    print(f"Correlation gate     :  30-day rolling Pearson threshold = {corr_threshold:.0%}")
+    print(f"Initial equity       :  ${iv:,.2f}")
     print(f"Universe: {', '.join(_TICKERS)}")
 
     # Plot portfolio equity curve
@@ -1545,11 +1618,12 @@ def main() -> None:
     parser.add_argument(
         "--stage",
         type=int,
-        default=31,
-        choices=[6, 9, 10, 31],
+        default=32,
+        choices=[6, 9, 10, 31, 32],
         help=(
             "Stage to run: 6/9/10 = legacy Stage 6–M2.1 robustness suite (2-ticker); "
-            "31 = M3.1 multi-symbol portfolio with correlation engine (default)"
+            "31 = M3.1 multi-symbol portfolio with correlation engine; "
+            "32 = M3.2 retail inverse-vol sizing ($10K default equity, corr 0.45) [default]"
         ),
     )
     args = parser.parse_args()
@@ -1570,7 +1644,16 @@ def main() -> None:
             raise
         return
     try:
-        if args.stage == 31:
+        if args.stage == 32:
+            # M3.2: retail inverse-vol sizing, tighter correlation gate
+            iv = args.initial_value if args.initial_value is not None else 10_000.0
+            run_m31_portfolio(
+                args.db.resolve(),
+                initial_value=iv,
+                corr_threshold=0.45,
+                use_vol_sizing=True,
+            )
+        elif args.stage == 31:
             run_m31_portfolio(
                 args.db.resolve(),
                 initial_value=args.initial_value,
