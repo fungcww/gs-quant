@@ -39,3 +39,41 @@
 ## Execution Costs
 - Slippage: 0.05% applied to fill reference price
 - Fees: Futu-style US stock estimate (via `OrderCost`)
+
+---
+
+## M4.1 Grid Search Findings — Alpha Decay Warning (2026-05-05)
+
+Grid: `sma_window` × `adx_buy_min` (→ `adx_trend_min`) × `vol_risk_fraction` — 36 combinations,
+2024 in-sample vs 2025 OOS via `grid_search_optimizer.py`.
+
+### Overfitting signature observed
+Top in-sample combinations did **not** transfer to OOS — ranking correlation is strongly negative
+among the top tier, which is the hallmark of alpha decay / regime-specific overfitting.
+
+| IS Rank | Params | IS Sharpe | OOS Sharpe | OOS Rank |
+|---------|--------|-----------|------------|----------|
+| 1 | sma=30, adx=25, vol=0.008 | 1.95 | 0.56 | 12 |
+| 2 | sma=30, adx=20, vol=0.008 | 1.91 | 1.07 | 4 |
+| 4 | sma=20, adx=20, vol=0.008 | 1.81 | −0.24 | 24 |
+
+### Robust combination (consistent IS → OOS)
+`sma=30, adx_trend_min=15` dominated both periods across all vol_risk_fraction levels.
+- IS rank 9 (Sharpe 1.69) → OOS rank 1 (Sharpe 1.78) — *improved* out-of-sample.
+- IS rank 14 (Sharpe 1.56) → OOS rank 2 (Sharpe 1.74).
+
+### Driver analysis
+- **High `adx_trend_min` (25)**: filters to few, high-conviction trend entries that worked in 2024's
+  momentum environment but missed 2025's noisier regime — regime-specific overfit.
+- **Fast SMA (sma=10)**: high IS ranking collapsed hardest OOS (rank −0.90 Sharpe); too many
+  false crossovers in a choppier 2025.
+- **High `vol_risk_fraction` (0.008)**: amplifies both IS gains and OOS losses — masks decay in IS,
+  magnifies it in OOS. Not an independent signal; interacts with the ADX overfit.
+
+### Rules going forward
+1. **Do not select parameters on IS Sharpe rank alone.** Require IS-OOS Sharpe consistency as
+   a co-criterion before promoting any combination to live.
+2. **Flag any IS Sharpe > 1.80 for extra OOS scrutiny** — in this sweep, every combination
+   above that threshold underperformed OOS.
+3. **Preferred anchor for further tuning**: `sma=30, adx_trend_min=15`; vol_risk_fraction
+   can then be sized to risk-appetite (0.002 = conservative, 0.008 = aggressive).
