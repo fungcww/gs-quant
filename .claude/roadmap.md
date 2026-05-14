@@ -44,6 +44,20 @@
 
 ---
 
+### Phase 5: Factor-Neutral Alpha Framework (HK) ← NEW
+**Exit criteria:** Idiosyncratic alpha of 1810.HK is isolated, tested across strategy philosophies, risk-sized to HK lot constraints, and enriched with US overnight spillover signal.
+
+See [.claude/factor_alpha_framework.md](.claude/factor_alpha_framework.md) for HK asset conventions and rules.
+
+| Milestone | File | Description | Status |
+|-----------|------|-------------|--------|
+| **M5.1** | `beta_engine.py` | **BetaCalculator: rolling 60-day OLS beta of 1810.HK vs ^HSTECH. Residual return = R_ticker − β×R_benchmark. 3-panel chart (price, rolling β, cumulative alpha). Summary stats printed.** | **Current** |
+| M5.2 | `tournament_optimizer.py` | Multi-logic tournament: TechnicalOnly vs SentimentAugmented vs MarketNeutralAlpha. Sharpe, Max Drawdown, Win Rate comparison report. | Pending |
+| M5.3 | `vol_sizer_hk.py` | VolatilitySizer (ATR or rolling std). HKEX lot-size constraint (200-share multiples). 5 bps slippage. Futu HK fee structure. | Pending |
+| M5.4 | `lead_lag_monitor.py` | LeadLagMonitor: QQQ/TSLA overnight return → 1810.HK open-to-09:45 correlation. Overnight_US_Spillover factor output. | Pending |
+
+---
+
 ## Stage Map (local_backtest_runner.py)
 
 | Stage | Description |
