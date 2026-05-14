@@ -1128,9 +1128,9 @@ class Commodity(Asset):
 
 
 class Company(Asset):
-    """Commodity
+    """Company
 
-    Represents a commodity.
+    Represents a company which may be referenced in a derivative transaction, or have equity or credit instruments which can be held
 
     """
 
@@ -1498,6 +1498,9 @@ class SecurityMaster:
 
         if asset_type == GsAssetType.Mutual_Fund.value:
             return MutualFund(gs_asset.id, gs_asset.name, gs_asset.asset_class, entity=asset_entity)
+
+        if asset_type == GsAssetType.Company.value:
+            return Company(gs_asset.id, gs_asset.assetClass, gs_asset.name, entity=asset_entity)
 
         raise TypeError(f'unsupported asset type {asset_type}')
 
