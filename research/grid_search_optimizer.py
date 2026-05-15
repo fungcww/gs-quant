@@ -67,6 +67,7 @@ from local_backtest_runner import (
     _load_symbol_ohlc,
     _nav_total_return_and_max_drawdown,
     _profit_factor_from_backtest,
+    _repo_root,
     ensure_market_db,
 )
 
@@ -122,13 +123,16 @@ def plot_equity_curves(
     benchmark_nav: pd.Series,
     *,
     title: str = "Strategy vs B&H Benchmark",
-    output_path: str = "charts/equity_curve_vs_bnh.png",
+    output_path: str | None = None,
 ) -> None:
     """Overlay strategy equity curve against equal-weight B&H benchmark.
 
     Green shading = strategy outperforming; red shading = strategy lagging.
     Requires matplotlib; prints a warning and skips silently if not installed.
     """
+    if output_path is None:
+        output_path = str(_repo_root() / "charts" / "equity_curve_vs_bnh.png")
+
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -565,7 +569,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="M4.1 Grid Search — Stage 32 / M3.2 parallel parameter sweep"
     )
-    parser.add_argument("--db", default="market.db", help="SQLite market database path")
+    parser.add_argument("--db", default=str(_repo_root() / "shared_data" / "market.db"), help="SQLite market database path")
     parser.add_argument(
         "--initial-value", type=float, default=_INITIAL_VALUE, metavar="USD",
         help=f"Initial portfolio equity (default ${_INITIAL_VALUE:,.0f})",
@@ -652,7 +656,7 @@ def main() -> None:
         return_nav=True,
     )
     period_label = args.period.upper()
-    chart_path = f"charts/equity_curve_vs_bnh_{args.period}.png"
+    chart_path = str(_repo_root() / "charts" / f"equity_curve_vs_bnh_{args.period}.png")
     plot_equity_curves(
         best_with_nav["nav"],
         benchmark["nav"],

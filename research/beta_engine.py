@@ -25,7 +25,7 @@ from gs_quant.timeseries.econometrics import beta as gsq_beta
 from gs_quant.timeseries.helper import Window
 from gs_quant.timeseries.technicals import moving_average as gsq_ma
 
-_DB_PATH = Path(__file__).parent / "shared_data" / "market.db"
+_DB_PATH = Path(__file__).parent.parent / "shared_data" / "market.db"
 _DATA_START = "2024-01-01"
 _DATA_END_EXCLUSIVE = "2026-01-01"
 
@@ -245,7 +245,7 @@ class BetaCalculator:
             self.compute_residual_returns()
 
         if output_path is None:
-            charts_dir = Path(__file__).parent / "charts"
+            charts_dir = Path(__file__).parent.parent / "charts"
             charts_dir.mkdir(exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = charts_dir / f"beta_engine_{ts}.png"

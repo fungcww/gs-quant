@@ -127,7 +127,7 @@ def _close_sql(symbol: str) -> str:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parent
+    return Path(__file__).resolve().parent.parent
 
 
 # All generated charts are written here (created on first run if absent)

@@ -2,8 +2,10 @@
 
 ## Project Overview
 Systematic trading strategy research built on top of the gs-quant library.
-- Primary backtest runner: `local_backtest_runner.py`
-- Market data: daily OHLC persisted in `market.db` (yfinance, tickers: AAPL, SMR)
+- Self-developed research scripts: `research/` (backtesters, optimizers, alpha engines)
+- gs-quant extensions (custom math/indicators): `gs_quant/` (extend in-place, not in research scripts)
+- Market data: daily OHLC persisted in `shared_data/market.db` (yfinance)
+- Output charts: `charts/`
 
 ---
 
