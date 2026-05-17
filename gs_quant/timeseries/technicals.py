@@ -340,6 +340,37 @@ def macd(x: pd.Series, m: int = 12, n: int = 26, s: int = 1) -> pd.Series:
 
 
 @plot_function
+def average_true_range(high: pd.Series, low: pd.Series, close: pd.Series,
+                       w: Union[Window, int] = 14) -> pd.Series:
+    """
+    Average True Range (ATR)
+
+    :param high: time series of daily high prices
+    :param low: time series of daily low prices
+    :param close: time series of daily close prices
+    :param w: smoothing window (default 14); uses Wilder smoothing via smoothed_moving_average
+    :return: date-based time series of ATR values
+
+    **Usage**
+
+    ATR measures market volatility as the greatest of: current high minus low,
+    absolute current high minus previous close, or absolute current low minus previous close.
+    Useful for position sizing (risk per share = ATR × multiplier).
+
+    **Examples**
+
+    >>> atr = average_true_range(high, low, close, 14)
+    """
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return smoothed_moving_average(tr, w)
+
+
+@plot_function
 def exponential_volatility(x: pd.Series, beta: float = 0.75) -> pd.Series:
     """
     Exponentially weighted volatility

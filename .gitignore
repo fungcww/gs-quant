@@ -9,4 +9,8 @@ research_results/*
 
 # Local research data (SQLite and other large, regenerable datasets)
 shared_data/
+charts/
 *.db
+
+# Local environment config — never commit secrets
+.env

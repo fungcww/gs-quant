@@ -6,13 +6,14 @@ daily returns to isolate idiosyncratic alpha via rolling OLS regression.
 
 Usage:
     python beta_engine.py
-    python beta_engine.py --start 2024-01-01 --end 2025-12-31 --window 60
+    python research/beta_engine.py --target 1024.HK --start 2025-01-01 --end 2026-05-14 --window 60
     python beta_engine.py --db market.db
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -20,16 +21,18 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
+from dotenv import load_dotenv
 from gs_quant.timeseries.econometrics import beta as gsq_beta
 from gs_quant.timeseries.helper import Window
 from gs_quant.timeseries.technicals import moving_average as gsq_ma
 
-_DB_PATH = Path(__file__).parent.parent / "shared_data" / "market.db"
-_DATA_START = "2024-01-01"
-_DATA_END_EXCLUSIVE = "2026-01-01"
+load_dotenv(Path(__file__).parent.parent / ".env")
 
-_HK_TICKERS = ("1810.HK", "3033.HK")  # 3033.HK = CSOP Hang Seng TECH Index ETF (^HSTECH proxy)
+_DB_PATH = Path(__file__).parent.parent / "shared_data" / "market.db"
+_DATA_START = os.getenv("DATA_START", "2025-01-01")
+_DATA_END_EXCLUSIVE = os.getenv("DATA_END_EXCLUSIVE", "2026-01-01")
+
+_HK_TICKERS = ("1024.HK", "3033.HK")  # 3033.HK = CSOP Hang Seng TECH Index ETF (^HSTECH proxy)
 
 
 def _fetch_ticker_history(symbol: str, start: str, end: str) -> tuple[str, pd.DataFrame]:

@@ -27,9 +27,9 @@ Local backtest using PredefinedAssetEngine + SQLiteDataSource (no GsSession / Ma
 
 Run from the repository root::
 
-    python local_backtest_runner.py              # Stage 32 M3.2 retail portfolio (default)
-    python local_backtest_runner.py --stage 31  # M3.1 multi-symbol portfolio (legacy default)
-    python local_backtest_runner.py --quick      # one week smoke test
+    python research/local_backtest_runner.py              # Stage 32 M3.2 retail portfolio (default)
+    python research/local_backtest_runner.py --stage 31  # M3.1 multi-symbol portfolio (legacy default)
+    python research/local_backtest_runner.py --quick      # one week smoke test
 """
 
 from __future__ import annotations
@@ -134,41 +134,35 @@ def _repo_root() -> Path:
 _CHARTS_DIR = _repo_root() / "charts"
 
 
-def _fetch_ticker_history(symbol: str, start: str, end: str) -> tuple[str, "pd.DataFrame"]:
-    """Download OHLCV for one ticker; runs in a thread (I/O-bound)."""
-    import yfinance as yf  # type: ignore[import-untyped]
-    hist = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=False)
-    return symbol, hist
+def _fetch_ticker_ohlcv(loader, symbol: str) -> tuple[str, "pd.DataFrame"]:
+    """Fetch OHLCV for one ticker via HistoricalDataLoader; runs in a thread (I/O-bound)."""
+    return symbol, loader.get_ohlcv(symbol, _DATA_START, _DATA_END_EXCLUSIVE)
 
 
 def ensure_market_db(db_path: Path) -> None:
-    """Create ``market_history`` if needed and load all _TICKERS daily OHLC from yfinance into ``market.db``.
+    """Create ``market_history`` if needed and load all _TICKERS daily OHLC into ``market.db``.
 
+    Data is fetched via HistoricalDataLoader (internal API → market.db fallback).
     Downloads are issued in parallel via ThreadPoolExecutor (I/O-bound); indicator pre-computation
     (ADX, RSI, SMA) is already vectorised over the full series so no further parallelism is needed there.
     Backtests are kept sequential because PredefinedAssetEngine holds mutable state that is not picklable.
     """
-    try:
-        import yfinance as yf  # noqa: F401 — validate install before spawning threads
-    except ImportError as e:
-        raise RuntimeError(
-            "yfinance is required for real-world data ingestion. Install with: pip install yfinance"
-        ) from e
+    from data_loader import HistoricalDataLoader  # local import to keep top-level imports clean
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    loader = HistoricalDataLoader()
 
-    # Parallel download — one thread per ticker, capped at 8 to avoid rate-limiting
-    print(f"Fetching {len(_TICKERS)} tickers from yfinance (parallel)…")
+    print(f"Fetching {len(_TICKERS)} tickers via HistoricalDataLoader (parallel)…")
     hist_by_sym: dict[str, "pd.DataFrame"] = {}
     with ThreadPoolExecutor(max_workers=min(len(_TICKERS), 8)) as pool:
         futures = {
-            pool.submit(_fetch_ticker_history, sym, _DATA_START, _DATA_END_EXCLUSIVE): sym
+            pool.submit(_fetch_ticker_ohlcv, loader, sym): sym
             for sym in _TICKERS
         }
         for fut in as_completed(futures):
             sym, hist = fut.result()
             if hist.empty:
-                raise RuntimeError(f"yfinance returned no rows for {sym!r}; check connectivity or ticker.")
+                raise RuntimeError(f"No data returned for {sym!r}; check API server or market.db.")
             hist_by_sym[sym] = hist
             print(f"  {sym}: {len(hist)} bars")
 
@@ -176,26 +170,13 @@ def ensure_market_db(db_path: Path) -> None:
     for symbol in _TICKERS:
         hist = hist_by_sym[symbol]
         for ts, bar in hist.iterrows():
-            close = bar.get("Close")
-            if close is None or (isinstance(close, float) and pd.isna(close)):
-                continue
-            open_px = bar.get("Open")
-            if open_px is None or (isinstance(open_px, float) and pd.isna(open_px)):
-                open_px = close
-            high = bar.get("High")
-            low = bar.get("Low")
-            if high is None or (isinstance(high, float) and pd.isna(high)):
-                high = close
-            if low is None or (isinstance(low, float) and pd.isna(low)):
-                low = close
-            vol = bar.get("Volume", 0)
-            if vol is None or (isinstance(vol, float) and pd.isna(vol)):
-                v_int = 0
-            else:
-                v_int = int(vol)
             d = pd.Timestamp(ts).date().strftime("%Y-%m-%d")
-            # customization: persist O/H/L for M2.1 next-day open execution and ADX(14)
-            rows.append((d, symbol, float(open_px), float(high), float(low), float(close), v_int))
+            rows.append((
+                d, symbol,
+                float(bar["open_price"]), float(bar["high_price"]),
+                float(bar["low_price"]),  float(bar["close_price"]),
+                int(bar["volume"]),
+            ))
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(

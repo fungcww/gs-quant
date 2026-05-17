@@ -23,6 +23,19 @@ Every trade simulation must account for Futu Securities trading fees. Never mode
 - When adding new execution paths, new stages, or new backtesting scripts, always pass fees through `OrderCost` — do not default to zero-fee or slippage-only models.
 - If a new script does not yet use `OrderCost`, flag it and add the fee before reporting results.
 
+## Historical Data Rule
+Never call yfinance, pandas-datareader, or any other third-party data provider directly to fetch historical OHLCV prices. All historical market data must go through `HistoricalDataLoader` in `research/data_loader.py`.
+
+```python
+from data_loader import HistoricalDataLoader
+loader = HistoricalDataLoader()
+df = loader.get_ohlcv(ticker, start_date, end_date)
+```
+
+`HistoricalDataLoader` hits the internal API server (`API_SERVER_URL` in `.env`) and falls back to `shared_data/market.db` if the server is unreachable. This applies to every script — new and existing. If an existing script calls yfinance directly, migrate it to `HistoricalDataLoader` before extending it.
+
+The one exception is `ensure_hk_data()` in `beta_engine.py`, which is the DB seed function that pre-dates this rule; do not add new yfinance call-sites modelled after it.
+
 ## gs-quant Library-First Rule
 Before building any new strategy component, indicator, or mathematical calculation:
 1. **Search the gs-quant library first** — check `gs_quant/timeseries/`, `gs_quant/analytics/`, `gs_quant/risk/`, and `gs_quant/markets/` for existing implementations.

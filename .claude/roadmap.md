@@ -1,6 +1,6 @@
 # Quant Framework Roadmap
 
-## Current Bookmark: Phase 5 → M5.2
+## Current Bookmark: Phase 5 → M5.3
 
 ---
 
@@ -52,9 +52,9 @@ See [.claude/factor_alpha_framework.md](.claude/factor_alpha_framework.md) for H
 | Milestone | File | Description | Status |
 |-----------|------|-------------|--------|
 | M5.1 | `beta_engine.py` | BetaCalculator: rolling 60-day OLS beta of 1810.HK vs ^HSTECH. Residual return = R_ticker − β×R_benchmark. 4-panel chart (price, rolling β, cumulative alpha, alpha velocity). Summary stats + Alpha Velocity signal printed. | Done |
-| **M5.1.5** | *(infra)* | **Sentiment DB Checkpoint. User provisions: Postgres instance, `daily_metrics` table with `sentiment_score` column, and supporting API credentials. Claude to receive schema + API details before M5.2 begins.** | **Current — awaiting user** |
-| M5.2 | `tournament_optimizer.py` | Multi-logic tournament: TechnicalOnly vs SentimentAugmented vs MarketNeutralAlpha. Sharpe, Max Drawdown, Win Rate comparison report. | Blocked on M5.1.5 |
-| M5.3 | `vol_sizer_hk.py` | VolatilitySizer (ATR or rolling std). HKEX lot-size constraint (200-share multiples). 5 bps slippage. Futu HK fee structure. | Pending |
+| M5.1.5 | *(infra)* | Sentiment DB Checkpoint. API live at http://192.168.31.208:8000, X-API-Key: quant_local. HTTP-only access (no direct Postgres from gs-quant container). CSV fallback if unreachable. | Done |
+| M5.2 | `tournament_optimizer.py` | Multi-logic tournament: TechnicalOnly vs SentimentAugmented vs MarketNeutralAlpha. Sharpe, Max Drawdown, Win Rate, Profit Factor, Alpha Contribution, returns correlation matrix. Sentiment via HTTP API (http://192.168.31.208:8000) with CSV fallback. ATR added to gs_quant/timeseries/technicals.py. | Done |
+| **M5.3** | `vol_sizer_hk.py` | **VolatilitySizer (ATR or rolling std). HKEX lot-size constraint (200-share multiples). 5 bps slippage. Futu HK fee structure.** | **Current** |
 | M5.4 | `lead_lag_monitor.py` | LeadLagMonitor: QQQ/TSLA overnight return → 1810.HK open-to-09:45 correlation. Overnight_US_Spillover factor output. | Pending |
 
 ---
