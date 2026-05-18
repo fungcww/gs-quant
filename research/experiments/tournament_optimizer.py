@@ -7,12 +7,14 @@ Compares three trading philosophies on 1810.HK (or any HK target):
   MarketNeutralAlpha — trades only when alpha_velocity > 0 (ignores market direction)
 
 Sizing: ATR-based risk budget, HKEX 200-share lot rounding, 5 bps slippage.
-Output: charts/tournament_<ts>.png  +  comparison_report.csv
+Output:
+  experiments/outputs/artifacts/tournament_<ts>.png   — equity-curve chart
+  experiments/outputs/artifacts/comparison_report.csv — summary metrics
 
 Usage:
-    python research/tournament_optimizer.py
-    python research/tournament_optimizer.py --target 1024.HK --start 2025-01-01 --end 2026-01-01
-    python research/tournament_optimizer.py --sentiment-fallback sentiment_fallback.csv
+    python research/experiments/tournament_optimizer.py
+    python research/experiments/tournament_optimizer.py --target 1024.HK --start 2025-01-01 --end 2026-01-01
+    python research/experiments/tournament_optimizer.py --sentiment-fallback sentiment_fallback.csv
 """
 
 from __future__ import annotations
@@ -38,12 +40,12 @@ from gs_quant.timeseries.technicals import (
     relative_strength_index as gsq_rsi,
 )
 
-from beta_engine import BetaCalculator, _DB_PATH
+from research.engines.beta_engine import BetaCalculator
+from research.engines.output_manager import OutputManager
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
 
-_REPO_ROOT = Path(__file__).parent.parent
-_CHARTS_DIR = _REPO_ROOT / "charts"
+_REPO_ROOT = Path(__file__).parent.parent.parent
 _RISK_FREE_ANNUAL = float(os.getenv("RISK_FREE_ANNUAL", "0.02"))
 _SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "5"))
 _HK_LOT_SIZE = int(os.getenv("HK_LOT_SIZE", "200"))
@@ -363,9 +365,8 @@ class TournamentEngine:
         import matplotlib.gridspec as gridspec
 
         if output_path is None:
-            _CHARTS_DIR.mkdir(exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = _CHARTS_DIR / f"tournament_{ts}.png"
+            output_path = OutputManager().artifact_path(f"tournament_{ts}.png")
 
         colors = {
             "TechnicalOnly": "#1f77b4",
@@ -430,8 +431,8 @@ class TournamentEngine:
         print(f"Chart saved → {output_path}")
         return output_path
 
-    def save_report(self, report: pd.DataFrame) -> Path:
-        out = _REPO_ROOT / "comparison_report.csv"
+    def save_report(self, report: pd.DataFrame, output_path: Path | None = None) -> Path:
+        out = output_path or OutputManager().artifact_path("comparison_report.csv")
         report.to_csv(out)
         print(f"Report saved → {out}")
         return out
@@ -476,6 +477,25 @@ class TournamentEngine:
 
 
 # ---------------------------------------------------------------------------
+# Production sync stub
+# ---------------------------------------------------------------------------
+
+def sync_champion_to_core_db(metrics_dict: dict) -> None:
+    """
+    Stub: push the winning strategy's aggregated metadata to the Linux PostgreSQL server.
+
+    Only the champion's summary payload travels over the API — raw scratch data (trade
+    logs, interim CSVs, SQLite) stays on local Mac storage and is never uploaded.
+    Replace the print statement with an authenticated HTTP POST to the core DB API
+    when the production endpoint is ready.
+    """
+    print(
+        f"[sync_champion_to_core_db] READY — champion payload staged for production DB push:\n"
+        f"  {metrics_dict}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -486,19 +506,15 @@ def main() -> None:
     parser.add_argument("--window", type=int, default=60, help="Rolling OLS window for beta (default 60)")
     parser.add_argument("--start", default=_DATA_START)
     parser.add_argument("--end", default=_DATA_END_EXCLUSIVE)
-    parser.add_argument("--db", type=Path, default=_DB_PATH)
     parser.add_argument("--initial-nav", type=float, default=10_000.0)
     parser.add_argument("--sentiment-api", default=_SENTIMENT_API_URL)
     parser.add_argument("--sentiment-key", default=_SENTIMENT_API_KEY)
     parser.add_argument("--sentiment-fallback", type=Path, default=None,
                         help="CSV fallback path with columns: date, symbol, sentiment_score")
-    parser.add_argument("--no-download", action="store_true")
     args = parser.parse_args()
 
     calc = BetaCalculator(target_ticker=args.target, benchmark_ticker=args.benchmark, window=args.window)
-    if not args.no_download:
-        calc.ensure_data(db_path=args.db, start=args.start, end=args.end)
-    calc.load_from_db(db_path=args.db, start=args.start, end=args.end)
+    calc.load(start=args.start, end=args.end)
     calc.compute_rolling_beta()
     calc.compute_residual_returns()
     calc.compute_alpha_velocity()
@@ -517,11 +533,21 @@ def main() -> None:
         initial_nav=args.initial_nav,
     )
 
+    om = OutputManager()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     print("\nRunning tournament…")
     report, navs = engine.run()
     engine.print_summary(report)
-    engine.save_report(report)
-    engine.plot(report, navs, calc._benchmark_prices)
+    engine.save_report(report, output_path=om.artifact_path("comparison_report.csv"))
+    engine.plot(report, navs, calc._benchmark_prices,
+                output_path=om.artifact_path(f"tournament_{ts}.png"))
+
+    # Identify champion by Sharpe and push metadata stub to production DB
+    if report["sharpe"].notna().any():
+        champion = report["sharpe"].idxmax()
+        champion_metrics = {"strategy": champion, **report.loc[champion].to_dict()}
+        sync_champion_to_core_db(champion_metrics)
 
 
 if __name__ == "__main__":

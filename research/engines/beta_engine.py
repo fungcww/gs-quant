@@ -7,15 +7,12 @@ daily returns to isolate idiosyncratic alpha via rolling OLS regression.
 Usage:
     python beta_engine.py
     python research/beta_engine.py --target 1024.HK --start 2025-01-01 --end 2026-05-14 --window 60
-    python beta_engine.py --db market.db
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import sqlite3
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -26,104 +23,12 @@ from gs_quant.timeseries.econometrics import beta as gsq_beta
 from gs_quant.timeseries.helper import Window
 from gs_quant.timeseries.technicals import moving_average as gsq_ma
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+from research.engines.data_loader import HistoricalDataLoader
 
-_DB_PATH = Path(__file__).parent.parent / "shared_data" / "market.db"
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
+
 _DATA_START = os.getenv("DATA_START", "2025-01-01")
 _DATA_END_EXCLUSIVE = os.getenv("DATA_END_EXCLUSIVE", "2026-01-01")
-
-_HK_TICKERS = ("1024.HK", "3033.HK")  # 3033.HK = CSOP Hang Seng TECH Index ETF (^HSTECH proxy)
-
-
-def _fetch_ticker_history(symbol: str, start: str, end: str) -> tuple[str, pd.DataFrame]:
-    import yfinance as yf
-    hist = yf.download(symbol, start=start, end=end, auto_adjust=True, progress=False)
-    if isinstance(hist.columns, pd.MultiIndex):
-        hist.columns = hist.columns.get_level_values(0)
-    return symbol, hist
-
-
-def ensure_hk_data(db_path: Path, start: str = _DATA_START, end: str = _DATA_END_EXCLUSIVE) -> None:
-    """Download 1810.HK and ^HSTECH from yfinance and persist to market.db (idempotent)."""
-    try:
-        import yfinance as yf  # noqa: F401
-    except ImportError as e:
-        raise RuntimeError("yfinance required: pip install yfinance") from e
-
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    print(f"Fetching HK tickers from yfinance: {_HK_TICKERS}")
-    hist_by_sym: dict[str, pd.DataFrame] = {}
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {pool.submit(_fetch_ticker_history, sym, start, end): sym for sym in _HK_TICKERS}
-        for fut in as_completed(futures):
-            sym, hist = fut.result()
-            if hist.empty:
-                raise RuntimeError(f"yfinance returned no data for {sym!r} — check connectivity.")
-            hist_by_sym[sym] = hist
-            print(f"  {sym}: {len(hist)} bars")
-
-    rows: list[tuple[str, str, float, float, float, float, int]] = []
-    for symbol in _HK_TICKERS:
-        hist = hist_by_sym[symbol]
-        for ts, bar in hist.iterrows():
-            close = bar.get("Close")
-            if close is None or (isinstance(close, float) and pd.isna(close)):
-                continue
-            open_px = bar.get("Open", close)
-            high = bar.get("High", close)
-            low = bar.get("Low", close)
-            vol = bar.get("Volume", 0)
-            if open_px is None or (isinstance(open_px, float) and pd.isna(open_px)):
-                open_px = close
-            if high is None or (isinstance(high, float) and pd.isna(high)):
-                high = close
-            if low is None or (isinstance(low, float) and pd.isna(low)):
-                low = close
-            v_int = 0 if (vol is None or (isinstance(vol, float) and pd.isna(vol))) else int(vol)
-            d = pd.Timestamp(ts).date().strftime("%Y-%m-%d")
-            rows.append((d, symbol, float(open_px), float(high), float(low), float(close), v_int))
-
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS market_history (
-                date TEXT,
-                symbol TEXT,
-                open_price REAL,
-                high_price REAL,
-                low_price REAL,
-                close_price REAL,
-                volume INTEGER,
-                PRIMARY KEY (date, symbol)
-            )
-            """
-        )
-        cur = conn.execute("PRAGMA table_info(market_history)")
-        col_names = {row[1] for row in cur.fetchall()}
-        for col in ("high_price", "low_price", "open_price"):
-            if col not in col_names:
-                conn.execute(f"ALTER TABLE market_history ADD COLUMN {col} REAL")
-        conn.executemany(
-            "INSERT OR REPLACE INTO market_history (date, symbol, open_price, high_price, low_price, close_price, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-        conn.commit()
-    print(f"  Persisted {len(rows)} rows to {db_path}")
-
-
-def _load_close_series(db_path: Path, symbol: str, start: str, end: str) -> pd.Series:
-    """Load close prices for a symbol from market.db as a date-indexed pd.Series."""
-    with sqlite3.connect(db_path) as conn:
-        df = pd.read_sql_query(
-            "SELECT date, close_price FROM market_history WHERE symbol = ? AND date >= ? AND date < ? ORDER BY date",
-            conn,
-            params=(symbol, start, end),
-        )
-    if df.empty:
-        raise ValueError(f"No data found in market.db for symbol={symbol!r} between {start} and {end}. Run ensure_hk_data() first.")
-    df["date"] = pd.to_datetime(df["date"])
-    return df.set_index("date")["close_price"].rename(symbol)
 
 
 class BetaCalculator:
@@ -145,14 +50,11 @@ class BetaCalculator:
         self._residual_returns: pd.Series | None = None
         self._alpha_velocity: pd.Series | None = None
 
-    def ensure_data(self, db_path: Path = _DB_PATH, start: str = _DATA_START, end: str = _DATA_END_EXCLUSIVE) -> "BetaCalculator":
-        ensure_hk_data(db_path, start, end)
-        return self
-
-    def load_from_db(self, db_path: Path = _DB_PATH, start: str = _DATA_START, end: str = _DATA_END_EXCLUSIVE) -> "BetaCalculator":
-        """Load close prices for target and benchmark from market.db."""
-        target = _load_close_series(db_path, self.target_ticker, start, end)
-        benchmark = _load_close_series(db_path, self.benchmark_ticker, start, end)
+    def load(self, start: str = _DATA_START, end: str = _DATA_END_EXCLUSIVE) -> "BetaCalculator":
+        """Load close prices for target and benchmark via HistoricalDataLoader."""
+        loader = HistoricalDataLoader()
+        target = loader.get_ohlcv(self.target_ticker, start, end)["close_price"].rename(self.target_ticker)
+        benchmark = loader.get_ohlcv(self.benchmark_ticker, start, end)["close_price"].rename(self.benchmark_ticker)
 
         # Align on intersection — handles HK holidays where index and stock may differ
         common_dates = target.index.intersection(benchmark.index)
@@ -164,7 +66,7 @@ class BetaCalculator:
     def compute_rolling_beta(self) -> pd.Series:
         """Compute 60-day rolling OLS (Ordinary Least Squares) beta using gs_quant.timeseries.econometrics.beta()."""
         if self._ticker_prices is None:
-            raise RuntimeError("Call load_from_db() before compute_rolling_beta()")
+            raise RuntimeError("Call load() before compute_rolling_beta()")
 
         # Window ramp=window: no partial-window betas emitted (avoids extreme early values)
         self._rolling_beta = gsq_beta(
@@ -248,10 +150,9 @@ class BetaCalculator:
             self.compute_residual_returns()
 
         if output_path is None:
-            charts_dir = Path(__file__).parent.parent / "charts"
-            charts_dir.mkdir(exist_ok=True)
+            from research.engines.output_manager import OutputManager
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = charts_dir / f"beta_engine_{ts}.png"
+            output_path = OutputManager().artifact_path(f"beta_engine_{ts}.png")
 
         # Normalized prices (base=100 at first common date)
         norm_target = self._ticker_prices / self._ticker_prices.iloc[0] * 100
@@ -376,16 +277,10 @@ def main() -> None:
     parser.add_argument("--window", type=int, default=60, help="Rolling OLS window in days (default: 60)")
     parser.add_argument("--start", default=_DATA_START, help="Start date YYYY-MM-DD")
     parser.add_argument("--end", default=_DATA_END_EXCLUSIVE, help="End date YYYY-MM-DD (exclusive)")
-    parser.add_argument("--db", type=Path, default=_DB_PATH, help="Path to market.db")
-    parser.add_argument("--no-download", action="store_true", help="Skip yfinance download, use existing DB data")
     args = parser.parse_args()
 
     calc = BetaCalculator(target_ticker=args.target, benchmark_ticker=args.benchmark, window=args.window)
-
-    if not args.no_download:
-        calc.ensure_data(db_path=args.db, start=args.start, end=args.end)
-
-    calc.load_from_db(db_path=args.db, start=args.start, end=args.end)
+    calc.load(start=args.start, end=args.end)
     calc.compute_rolling_beta()
     calc.compute_residual_returns()
     calc.compute_alpha_velocity()

@@ -56,7 +56,7 @@ from gs_quant.backtests.strategy import Strategy
 from gs_quant.data.core import DataFrequency
 from gs_quant.instrument import EqStock
 
-from local_backtest_runner import (
+from research.experiments.local_backtest_runner import (
     DEFAULT_SLIPPAGE_FRACTION,
     MACrossoverEODTrigger,
     _TICKERS,

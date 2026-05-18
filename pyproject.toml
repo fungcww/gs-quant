@@ -125,7 +125,7 @@ include-package-data = true
 version = {attr = "gs_quant.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["gs_quant*"]
+include = ["gs_quant*", "research*"]
 
 [tool.setuptools.package-data]
 gs_quant = [

@@ -127,7 +127,7 @@ def _close_sql(symbol: str) -> str:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    return Path(__file__).resolve().parent.parent.parent
 
 
 # All generated charts are written here (created on first run if absent)
@@ -147,7 +147,7 @@ def ensure_market_db(db_path: Path) -> None:
     (ADX, RSI, SMA) is already vectorised over the full series so no further parallelism is needed there.
     Backtests are kept sequential because PredefinedAssetEngine holds mutable state that is not picklable.
     """
-    from data_loader import HistoricalDataLoader  # local import to keep top-level imports clean
+    from research.engines.data_loader import HistoricalDataLoader  # local import to keep top-level imports clean
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     loader = HistoricalDataLoader()

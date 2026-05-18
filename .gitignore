@@ -14,3 +14,7 @@ charts/
 
 # Local environment config — never commit secrets
 .env
+
+# Experiment outputs — ephemeral, never commit
+research/experiments/outputs/scratch/
+research/experiments/outputs/artifacts/
